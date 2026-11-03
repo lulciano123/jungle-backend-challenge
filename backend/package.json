@@ -1,3 +1,4 @@
+
 {
   "name": "backend",
   "version": "0.0.1",
@@ -10,16 +11,16 @@
     "build": "nest build",
     "deploy": "nest deploy",
     "format": "prettier --write \"src/**/*.ts\" \"test/**/*.ts\"",
-    "start": "nest start",
+    "start": "bun run build && bun dist/main.js",
     "start:dev": "nest start --watch",
     "start:debug": "nest start --debug --watch",
-    "start:prod": "node dist/main",
+    "start:prod": "bun dist/main.js",
     "lint": "oxlint --type-aware src/ test/",
-    "test": "vitest run",
-    "test:watch": "vitest",
-    "test:cov": "vitest run --coverage",
-    "test:debug": "vitest --inspect-brk --no-file-parallelism",
-    "test:e2e": "vitest run --config ./vitest.config.e2e.ts"
+    "test": "bun test src/",
+    "test:watch": "bun test --watch src/",
+    "test:cov": "bun test --coverage src/",
+    "test:debug": "bun test --inspect-brk src/",
+    "test:e2e": "bun test test/"
   },
   "dependencies": {
     "@mikro-orm/core": "7",

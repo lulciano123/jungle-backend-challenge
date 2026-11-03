@@ -1,3 +1,4 @@
+
 import { describe, expect, it } from 'vitest';
 import { Money } from '../value-objects/money.js';
 import {
@@ -81,6 +82,62 @@ describe('WalletLedgerEntry', () => {
         '0.00',
         '100.00',
       ),
+    ).toThrow();
+  });
+
+  it('deve proteger a data contra alterações externas', () => {
+    const originalDate = new Date('2026-11-03T12:00:00Z');
+
+    const entry = WalletLedgerEntry.create({
+      id: 'ledger-001',
+      walletId: 'wallet-001',
+      transactionId: 'transaction-001',
+      direction: LedgerDirection.Debit,
+      money: brl('20.00'),
+      balanceBefore: brl('100.00'),
+      balanceAfter: brl('80.00'),
+      createdAt: originalDate,
+    });
+
+    originalDate.setTime(0);
+
+    const externalDate = entry.createdAt;
+    externalDate.setTime(0);
+
+    expect(entry.createdAt.toISOString())
+      .toBe('2026-11-03T12:00:00.000Z');
+
+    expect(Reflect.get(entry, '_createdAt'))
+      .toBeUndefined();
+  });
+
+  it('deve rejeitar uma data inválida', () => {
+    expect(() =>
+      WalletLedgerEntry.create({
+        id: 'ledger-001',
+        walletId: 'wallet-001',
+        transactionId: 'transaction-001',
+        direction: LedgerDirection.Debit,
+        money: brl('20.00'),
+        balanceBefore: brl('100.00'),
+        balanceAfter: brl('80.00'),
+        createdAt: new Date('invalid'),
+      }),
+    ).toThrow();
+  });
+
+  it('deve rejeitar movimentação monetária negativa', () => {
+    expect(() =>
+      WalletLedgerEntry.create({
+        id: 'ledger-001',
+        walletId: 'wallet-001',
+        transactionId: 'transaction-001',
+        direction: LedgerDirection.Debit,
+        money: brl('20.00').negate(),
+        balanceBefore: brl('100.00'),
+        balanceAfter: brl('120.00'),
+        createdAt: new Date('2026-11-03T12:00:00Z'),
+      }),
     ).toThrow();
   });
 });

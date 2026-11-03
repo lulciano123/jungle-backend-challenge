@@ -172,4 +172,29 @@ describe('Money', () => {
     expect(brl('10.00').equals(brl('20.00')))
       .toBe(false);
   });
+
+  // ==========================================
+  // 7. REGRESSÃO DE SEGURANÇA
+  // ==========================================
+
+  it('não deve permitir alteração do valor interno em runtime', () => {
+    const money = brl('100.00');
+
+    // Tentativa de acessar o antigo campo privado
+    // que era exposto em tempo de execução.
+    const internal = Reflect.get(money, 'value') as unknown;
+
+    expect(internal).toBeUndefined();
+
+    if (internal !== null && typeof internal === 'object') {
+      Reflect.set(internal, 's', -1);
+    }
+
+    expect(money.toJSON()).toEqual({
+      amount: '100.00',
+      currency: 'BRL',
+    });
+
+    expect(money.isPositive()).toBe(true);
+  });
 });

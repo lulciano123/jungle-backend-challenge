@@ -1,3 +1,4 @@
+
 import { Money } from '../value-objects/money.js';
 
 export enum LedgerDirection {
@@ -19,7 +20,7 @@ export interface CreateLedgerEntryProps {
 export type LedgerEntryState = CreateLedgerEntryProps;
 
 export class WalletLedgerEntry {
-  private readonly _createdAt: Date;
+  readonly #createdAtMs: number;
 
   private constructor(
     public readonly id: string,
@@ -31,17 +32,20 @@ export class WalletLedgerEntry {
     public readonly balanceAfter: Money,
     createdAt: Date,
   ) {
-    // Copia a data para evitar alterações externas.
-    this._createdAt = new Date(createdAt.getTime());
+    // Guarda um número, não uma referência mutável ao Date.
+    this.#createdAtMs = createdAt.getTime();
 
     Object.freeze(this);
   }
 
   static create(props: CreateLedgerEntryProps): WalletLedgerEntry {
     if (
-      !props.id?.trim() ||
-      !props.walletId?.trim() ||
-      !props.transactionId?.trim()
+      typeof props?.id !== 'string' ||
+      !props.id.trim() ||
+      typeof props.walletId !== 'string' ||
+      !props.walletId.trim() ||
+      typeof props.transactionId !== 'string' ||
+      !props.transactionId.trim()
     ) {
       throw new Error('Identificadores do ledger inválidos');
     }
@@ -106,8 +110,8 @@ export class WalletLedgerEntry {
     return entry;
   }
 
-  // Reconstrói um lançamento já persistido.
-  // Não reexecuta as regras de criação.
+  // Reconstrói um lançamento persistido sem
+  // reexecutar regras de transição financeira.
   static rehydrate(state: LedgerEntryState): WalletLedgerEntry {
     return new WalletLedgerEntry(
       state.id,
@@ -122,8 +126,8 @@ export class WalletLedgerEntry {
   }
 
   get createdAt(): Date {
-    // Retorna cópia para proteger a data interna.
-    return new Date(this._createdAt.getTime());
+    // Retorna uma cópia, protegendo o timestamp interno.
+    return new Date(this.#createdAtMs);
   }
 
   isBalanced(): boolean {

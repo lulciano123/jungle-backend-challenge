@@ -5,20 +5,27 @@ export interface MoneyProps {
   currency: string;
 }
 
-// Configuração isolada para cálculos monetários.
-const MoneyDecimal = Decimal.clone({ precision: 40 });
+// Configuração decimal independente das opções globais.
+const MoneyDecimal = Decimal.clone({
+  defaults: true,
+  precision: 40,
+});
 
-// Limite escolhido para compatibilidade futura
-// com uma coluna NUMERIC(20, 2) no PostgreSQL.
+// Compatível com NUMERIC(20, 2) do PostgreSQL.
 const MAX_AMOUNT = new MoneyDecimal('999999999999999999.99');
 
-// Exige valores como "0.00", "25.50" e "100.00".
+// Moedas ISO 4217 suportadas inicialmente pelo sistema.
+const SUPPORTED_CURRENCIES = new Set(['BRL', 'USD']);
+
+// Exige valores positivos ou zero, com duas casas decimais.
 const AMOUNT_PATTERN = /^(0|[1-9]\d{0,17})\.\d{2}$/;
 const CURRENCY_PATTERN = /^[A-Z]{3}$/;
 
 export class Money {
+  readonly #value: Decimal;
+
   private constructor(
-    private readonly value: Decimal,
+    value: Decimal,
     public readonly currency: string,
   ) {
     if (!value.isFinite() || value.abs().greaterThan(MAX_AMOUNT)) {
@@ -29,15 +36,18 @@ export class Money {
       throw new Error('Valor monetário com precisão inválida');
     }
 
+    this.#value = new MoneyDecimal(value);
+
     Object.freeze(this);
   }
 
   static from(props: MoneyProps): Money {
     if (
       typeof props?.currency !== 'string' ||
-      !CURRENCY_PATTERN.test(props.currency)
+      !CURRENCY_PATTERN.test(props.currency) ||
+      !SUPPORTED_CURRENCIES.has(props.currency)
     ) {
-      throw new Error('Moeda inválida');
+      throw new Error('Moeda não suportada');
     }
 
     if (
@@ -64,7 +74,7 @@ export class Money {
     this.assertSameCurrency(other);
 
     return new Money(
-      this.value.plus(other.value),
+      this.#value.plus(other.#value),
       this.currency,
     );
   }
@@ -73,52 +83,52 @@ export class Money {
     this.assertSameCurrency(other);
 
     return new Money(
-      this.value.minus(other.value),
+      this.#value.minus(other.#value),
       this.currency,
     );
   }
 
   negate(): Money {
     return new Money(
-      this.value.negated(),
+      this.#value.negated(),
       this.currency,
     );
   }
 
   isZero(): boolean {
-    return this.value.isZero();
+    return this.#value.isZero();
   }
 
   isPositive(): boolean {
-    return this.value.greaterThan(0);
+    return this.#value.greaterThan(0);
   }
 
   isNegative(): boolean {
-    return this.value.lessThan(0);
+    return this.#value.lessThan(0);
   }
 
   isLessThan(other: Money): boolean {
     this.assertSameCurrency(other);
 
-    return this.value.lessThan(other.value);
+    return this.#value.lessThan(other.#value);
   }
 
   equals(other: Money): boolean {
     return (
       this.currency === other.currency &&
-      this.value.equals(other.value)
+      this.#value.equals(other.#value)
     );
   }
 
   toJSON(): MoneyProps {
     return {
-      amount: this.value.toFixed(2),
+      amount: this.#value.toFixed(2),
       currency: this.currency,
     };
   }
 
   toString(): string {
-    return `${this.value.toFixed(2)} ${this.currency}`;
+    return `${this.#value.toFixed(2)} ${this.currency}`;
   }
 
   private assertSameCurrency(other: Money): void {
