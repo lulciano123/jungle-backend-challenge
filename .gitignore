@@ -23,3 +23,6 @@ coverage/
 
 # Dados locais
 .local/
+
+# Cache incremental do TypeScript
+*.tsbuildinfo
