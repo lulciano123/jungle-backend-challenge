@@ -1,0 +1,25 @@
+# Dependências
+node_modules/
+**/node_modules/
+
+# Compilação e cobertura
+dist/
+**/dist/
+coverage/
+**/coverage/
+
+# Variáveis de ambiente e segredos
+.env
+.env.*
+!.env.example
+
+# Logs e arquivos temporários
+*.log
+*.tmp
+
+# Sistema operacional e editor
+.DS_Store
+.vscode/
+
+# Dados locais
+.local/
