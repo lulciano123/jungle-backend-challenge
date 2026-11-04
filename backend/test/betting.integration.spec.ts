@@ -61,6 +61,8 @@ describe('BettingService - Integração com PostgreSQL', () => {
       walletId,
       playerId,
       providerId: 'integration-test-provider',
+      roundId: 'round-integration-test',
+      gameId: 'game-integration-test',
       externalTransactionId: randomUUID(),
       idempotencyKey: randomUUID(),
       amount: '80.00',

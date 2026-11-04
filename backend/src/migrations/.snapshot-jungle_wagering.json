@@ -379,6 +379,18 @@
         },
         {
           "columnNames": [
+            "id",
+            "wallet_id",
+            "currency"
+          ],
+          "composite": true,
+          "constraint": true,
+          "keyName": "wager_transactions_id_wallet_currency_unique",
+          "primary": false,
+          "unique": true
+        },
+        {
+          "columnNames": [
             "idempotency_key"
           ],
           "composite": false,
@@ -450,6 +462,12 @@
           "name": "wager_transactions_kind_check",
           "expression": "\"kind\" in ('OPENING', 'BET', 'WIN', 'LOSS', 'REFUND', 'ROLLBACK')",
           "definition": "check (\"kind\" in ('OPENING', 'BET', 'WIN', 'LOSS', 'REFUND', 'ROLLBACK'))",
+          "columnName": "kind"
+        },
+        {
+          "name": "wager_transactions_processed_reversal_reference_check",
+          "expression": "(kind <> ALL (ARRAY['REFUND'::character varying, 'ROLLBACK'::character varying])) OR (status <> 'PROCESSED'::text) OR (reference_transaction_id IS NOT NULL)",
+          "definition": "CHECK ((((kind)::text <> ALL ((ARRAY['REFUND'::character varying, 'ROLLBACK'::character varying])::text[])) OR ((status)::text <> 'PROCESSED'::text) OR (reference_transaction_id IS NOT NULL)))",
           "columnName": "kind"
         },
         {
@@ -744,6 +762,21 @@
           "localTableName": "public.wallet_ledger_entries",
           "referencedColumnNames": [
             "id",
+            "currency"
+          ],
+          "referencedTableName": "public.wager_transactions"
+        },
+        "wallet_ledger_transaction_wallet_currency_fk": {
+          "columnNames": [
+            "transaction_id",
+            "wallet_id",
+            "currency"
+          ],
+          "constraintName": "wallet_ledger_transaction_wallet_currency_fk",
+          "localTableName": "public.wallet_ledger_entries",
+          "referencedColumnNames": [
+            "id",
+            "wallet_id",
             "currency"
           ],
           "referencedTableName": "public.wager_transactions"

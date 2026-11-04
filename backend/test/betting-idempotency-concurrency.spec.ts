@@ -82,6 +82,8 @@ describe('BettingService - Idempotência concorrente', () => {
       walletId,
       playerId,
       providerId: 'idempotency-concurrency-test',
+      roundId: 'round-idempotency-concurrency-test',
+      gameId: 'game-idempotency-concurrency-test',
       externalTransactionId: randomUUID(),
       idempotencyKey: randomUUID(),
       amount: '80.00',

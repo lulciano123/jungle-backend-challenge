@@ -49,6 +49,8 @@ describe('BettingService - Rollback financeiro', () => {
       walletId,
       playerId,
       providerId: 'rollback-test-provider',
+      roundId: 'round-rollback-test',
+      gameId: 'game-rollback-test',
       externalTransactionId: randomUUID(),
       idempotencyKey: randomUUID(),
       amount: '80.00',

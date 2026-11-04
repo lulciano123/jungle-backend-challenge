@@ -74,6 +74,8 @@ describe('BettingService - Concorrência real', () => {
       walletId,
       playerId,
       providerId: 'concurrency-test-provider',
+      roundId: 'round-concurrency-test',
+      gameId: 'game-concurrency-test',
       amount: '80.00',
       currency: 'BRL',
     };

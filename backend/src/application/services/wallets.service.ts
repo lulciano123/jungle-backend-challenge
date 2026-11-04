@@ -67,6 +67,8 @@ export class WalletsService {
       throw new Error('Identificador do jogador inválido');
     }
 
+    const playerId = command.playerId.toLowerCase();
+
     // Money impede floats, formatos inválidos,
     // moedas não suportadas e valores negativos.
     const initialBalance = Money.from(command.initialBalance);
@@ -75,7 +77,7 @@ export class WalletsService {
 
     const wallet = Wallet.open({
       id: walletId,
-      playerId: command.playerId,
+      playerId,
       initialBalance,
     });
 
