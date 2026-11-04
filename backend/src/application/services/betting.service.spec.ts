@@ -1,6 +1,10 @@
 import { describe, expect, it, vi } from 'vitest';
 import { EntityManager } from '@mikro-orm/postgresql';
-import { BettingService, type PlaceBetCommand } from './betting.service.js';
+import {
+  BettingService,
+  type PlaceBetCommand,
+  type SubmitWagerCommand,
+} from './betting.service.js';
 
 describe('BettingService - Contrato obrigatório', () => {
   const validCommand: PlaceBetCommand = {
@@ -47,5 +51,27 @@ describe('BettingService - Contrato obrigatório', () => {
         expect(execute).not.toHaveBeenCalled();
       });
     }
+  }
+
+  for (const kind of ['OPENING', 'REFUND', 'ROLLBACK']) {
+    it(`rejeita ${kind} antes de iniciar uma transação`, async () => {
+      const transactional = vi.fn();
+      const service = new BettingService({ transactional } as unknown as EntityManager);
+      const command = { ...validCommand, kind } as SubmitWagerCommand;
+      await expect(service.submitTransaction(command)).rejects.toThrow('Tipo de operação não suportado');
+      expect(transactional).not.toHaveBeenCalled();
+    });
+  }
+
+  for (const referenceExternalTransactionId of [null, '', '   ']) {
+    it(`rejeita referência WIN inválida antes de iniciar uma transação: ${JSON.stringify(referenceExternalTransactionId)}`, async () => {
+      const transactional = vi.fn();
+      const service = new BettingService({ transactional } as unknown as EntityManager);
+      const command = {
+        ...validCommand, kind: 'WIN', referenceExternalTransactionId,
+      } as SubmitWagerCommand;
+      await expect(service.submitTransaction(command)).rejects.toThrow('Referência externa inválida');
+      expect(transactional).not.toHaveBeenCalled();
+    });
   }
 });

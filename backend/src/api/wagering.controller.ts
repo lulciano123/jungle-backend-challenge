@@ -9,12 +9,14 @@ import {
   HttpStatus,
   NotFoundException,
   Post,
+  Res,
   UnprocessableEntityException,
 } from '@nestjs/common';
+import type { Response } from 'express';
 import {
   BettingService,
   IdempotencyConflictError,
-  type PlaceBetCommand,
+  type SubmitWagerCommand,
 } from '../application/services/betting.service.js';
 import { Money } from '../domain/value-objects/money.js';
 
@@ -45,7 +47,7 @@ function isUUID(value: unknown): value is string {
 
 export interface WageringHttpResult {
   transactionId: string;
-  status: 'PROCESSED' | 'REJECTED';
+  status: 'PROCESSED' | 'REJECTED' | 'PENDING_REFERENCE';
   balance: {
     amount: string;
     currency: string;
@@ -63,6 +65,7 @@ export class WageringController {
   async submitTransaction(
     @Body() body: unknown,
     @Headers('idempotency-key') idempotencyKey: string | undefined,
+    @Res({ passthrough: true }) httpResponse: Response,
   ): Promise<WageringHttpResult> {
     // O header é a fonte da verdade para a idempotência.
     if (!isNonEmptyString(idempotencyKey)) {
@@ -80,11 +83,21 @@ export class WageringController {
       });
     }
 
-    // Nesta etapa, somente BET está implementado.
-    if (body.kind !== 'BET') {
+    if (body.kind !== 'BET' && body.kind !== 'WIN' && body.kind !== 'LOSS') {
       throw new BadRequestException({
         code: 'UNSUPPORTED_TRANSACTION_KIND',
-        message: 'Somente BET está disponível nesta etapa',
+        message: 'Tipos disponíveis: BET, WIN e LOSS',
+      });
+    }
+
+    if (
+      body.kind === 'WIN' &&
+      body.referenceExternalTransactionId !== undefined &&
+      !isNonEmptyString(body.referenceExternalTransactionId)
+    ) {
+      throw new BadRequestException({
+        code: 'INVALID_REFERENCE',
+        message: 'referenceExternalTransactionId deve ser uma string não vazia',
       });
     }
 
@@ -133,7 +146,7 @@ export class WageringController {
       const money = Money.from({ amount, currency });
 
       if (!money.isPositive()) {
-        throw new Error('O valor da aposta deve ser positivo');
+        throw new Error('O valor da operação deve ser positivo');
       }
     } catch (error) {
       throw new BadRequestException({
@@ -145,7 +158,8 @@ export class WageringController {
       });
     }
 
-    const command: PlaceBetCommand = {
+    const command: SubmitWagerCommand = {
+      kind: body.kind,
       playerId: body.playerId,
       walletId: body.walletId,
       providerId: body.providerId,
@@ -155,11 +169,14 @@ export class WageringController {
       idempotencyKey,
       amount,
       currency,
+      ...(body.kind === 'WIN' && body.referenceExternalTransactionId !== undefined
+        ? { referenceExternalTransactionId: body.referenceExternalTransactionId as string }
+        : {}),
     };
 
     try {
       const execution =
-        await this.bettingService.placeBetWithMetadata(command);
+        await this.bettingService.submitTransaction(command);
 
       const { result, idempotentReplay } = execution;
 
@@ -181,6 +198,10 @@ export class WageringController {
           code: result.failureCode ?? 'BUSINESS_RULE_REJECTED',
           ...response,
         });
+      }
+
+      if (result.status === 'PENDING_REFERENCE') {
+        httpResponse.status(HttpStatus.ACCEPTED);
       }
 
       return response;

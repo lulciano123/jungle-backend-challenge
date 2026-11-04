@@ -41,7 +41,10 @@ describe('BettingService - Rollback financeiro', () => {
     }
   });
 
-  it('deve desfazer tudo se o ledger falhar', async () => {
+  it.each([
+    ['BET', '20.00'],
+    ['WIN', '180.00'],
+  ] as const)('deve desfazer tudo se o ledger de %s falhar', async (kind, finalBalance) => {
     const walletId = randomUUID();
     const playerId = randomUUID();
 
@@ -114,7 +117,7 @@ describe('BettingService - Rollback financeiro', () => {
       let capturedError: unknown;
 
       try {
-        await service.placeBet(command);
+        await service.submitTransaction({ ...command, kind });
       } catch (error) {
         capturedError = error;
       }
@@ -190,10 +193,10 @@ describe('BettingService - Rollback financeiro', () => {
     // consumido a chave de idempotência.
     const retryService = new BettingService(orm.em.fork());
 
-    const result = await retryService.placeBet(command);
+    const { result } = await retryService.submitTransaction({ ...command, kind });
 
     expect(result.status).toBe('PROCESSED');
-    expect(result.balance).toBe('20.00');
+    expect(result.balance).toBe(finalBalance);
     expect(result.failureCode).toBeNull();
 
     const verify = orm.em.fork();
@@ -209,7 +212,7 @@ describe('BettingService - Rollback financeiro', () => {
       [walletId],
     );
 
-    expect(wallets[0].balance).toBe('20.00');
+    expect(wallets[0].balance).toBe(finalBalance);
     expect(wallets[0].version).toBe('2');
 
     const ledger = await verify.execute<CountRow[]>(

@@ -18,9 +18,16 @@ export interface PlaceBetCommand {
   gameId: string;
 }
 
+export type WagerKind = 'BET' | 'WIN' | 'LOSS';
+
+export interface SubmitWagerCommand extends PlaceBetCommand {
+  kind: WagerKind;
+  referenceExternalTransactionId?: string;
+}
+
 export interface PlaceBetResult {
   transactionId: string;
-  status: 'PROCESSED' | 'REJECTED';
+  status: 'PROCESSED' | 'REJECTED' | 'PENDING_REFERENCE';
   balance: string;
   currency: string;
   failureCode: string | null;
@@ -46,6 +53,15 @@ interface ExistingTransactionRow {
 
 interface UpdatedWalletRow {
   balance: string;
+}
+
+interface ReferenceTransactionRow {
+  id: string;
+  player_id: string;
+  wallet_id: string;
+  currency: string;
+  round_id: string | null;
+  kind: string;
 }
 
 const UUID_PATTERN =
@@ -112,6 +128,12 @@ export class BettingService {
   async placeBetWithMetadata(
     command: PlaceBetCommand,
   ): Promise<PlaceBetExecution> {
+    return this.submitTransaction({ ...command, kind: 'BET' });
+  }
+
+  async submitTransaction(
+    command: SubmitWagerCommand,
+  ): Promise<PlaceBetExecution> {
     this.validateCommand(command);
 
     const playerId = command.playerId.toLowerCase();
@@ -123,10 +145,13 @@ export class BettingService {
     });
 
     if (!amount.isPositive()) {
-      throw new Error('A aposta deve ter valor positivo');
+      throw new Error('A operação deve ter valor positivo');
     }
 
     const normalizedAmount = amount.toJSON().amount;
+    const referenceExternalTransactionId = command.kind === 'WIN'
+      ? command.referenceExternalTransactionId
+      : undefined;
 
     // Representação determinística dos dados financeiros.
     // A chave de idempotência não faz parte do hash.
@@ -135,9 +160,13 @@ export class BettingService {
       currency: command.currency,
       externalTransactionId: command.externalTransactionId,
       gameId: command.gameId,
-      kind: 'BET',
+      kind: command.kind,
       playerId,
       providerId: command.providerId,
+      // Ausência de referência preserva o hash das apostas já existentes.
+      ...(referenceExternalTransactionId !== undefined
+        ? { referenceExternalTransactionId }
+        : {}),
       roundId: command.roundId,
       walletId,
     };
@@ -228,8 +257,7 @@ export class BettingService {
             );
           }
 
-          // Replay legítimo:
-          // não debita novamente e não gera ledger.
+          // Replay não reaplica efeitos financeiros nem gera ledger.
           return {
             result: originalResponse,
             idempotentReplay: true,
@@ -242,20 +270,70 @@ export class BettingService {
           currency: wallet.currency,
         });
 
-        const approved = !balanceBefore.isLessThan(amount);
+        let status: PlaceBetResult['status'] = 'PROCESSED';
+        let failureCode: string | null = null;
+        let referenceTransactionId: string | null = null;
+        let balanceAfter = balanceBefore;
 
-        const balanceAfter = approved
-          ? balanceBefore.subtract(amount)
-          : balanceBefore;
+        if (referenceExternalTransactionId !== undefined) {
+          const references = await tx.execute<ReferenceTransactionRow[]>(
+            `
+            SELECT id, player_id, wallet_id, currency, round_id, kind
+            FROM wager_transactions
+            WHERE provider_id = ? AND external_transaction_id = ?
+            `,
+            [command.providerId, referenceExternalTransactionId],
+          );
+          const reference = references[0];
+
+          if (!reference) {
+            status = 'PENDING_REFERENCE';
+          } else {
+            referenceTransactionId = reference.id;
+
+            if (reference.kind !== 'BET') {
+              status = 'REJECTED';
+              failureCode = 'INVALID_REFERENCE_KIND';
+            } else if (
+              reference.player_id !== playerId ||
+              reference.wallet_id !== walletId ||
+              reference.currency !== command.currency ||
+              reference.round_id !== command.roundId
+            ) {
+              status = 'REJECTED';
+              failureCode = 'REFERENCE_MISMATCH';
+            }
+          }
+        }
+
+        if (status === 'PROCESSED' && command.kind === 'BET') {
+          if (balanceBefore.isLessThan(amount)) {
+            status = 'REJECTED';
+            failureCode = 'INSUFFICIENT_FUNDS';
+          } else {
+            balanceAfter = balanceBefore.subtract(amount);
+          }
+        } else if (status === 'PROCESSED' && command.kind === 'WIN') {
+          try {
+            balanceAfter = balanceBefore.add(amount);
+          } catch (error) {
+            if (!(error instanceof RangeError)) {
+              throw error;
+            }
+
+            status = 'REJECTED';
+            failureCode = 'BALANCE_LIMIT_EXCEEDED';
+          }
+        }
 
         const transactionId = randomUUID();
 
         const result: PlaceBetResult = {
           transactionId,
-          status: approved ? 'PROCESSED' : 'REJECTED',
+          status,
           balance: balanceAfter.toJSON().amount,
           currency: command.currency,
-          failureCode: approved ? null : 'INSUFFICIENT_FUNDS',
+          failureCode,
         };
 
         // 4. Persiste a decisão e a resposta original.
@@ -277,6 +355,8 @@ export class BettingService {
             status,
             amount,
             currency,
+            reference_external_transaction_id,
+            reference_transaction_id,
             failure_code,
             result_balance,
             original_response,
@@ -284,8 +364,9 @@ export class BettingService {
           )
           VALUES (
             ?, ?, ?, ?, ?, ?, ?, ?, ?,
-            'BET', ?, ?::numeric, ?, ?,
-            ?::numeric, ?::jsonb, NOW()
+            ?, ?, ?::numeric, ?, ?, ?, ?,
+            ?::numeric, ?::jsonb,
+            CASE WHEN ? = 'PENDING_REFERENCE' THEN NULL ELSE NOW() END
           )
           `,
           [
@@ -298,42 +379,49 @@ export class BettingService {
             payloadHash,
             command.roundId,
             command.gameId,
+            command.kind,
             result.status,
             normalizedAmount,
             command.currency,
+            referenceExternalTransactionId ?? null,
+            referenceTransactionId,
             result.failureCode,
             result.balance,
             JSON.stringify(result),
+            result.status,
           ],
         );
 
-        // Rejeições financeiras não alteram saldo
-        // e não geram lançamentos no ledger.
-        if (!approved) {
+        // LOSS, rejeições e referências pendentes não alteram saldo ou versão.
+        if (status !== 'PROCESSED' || command.kind === 'LOSS') {
           return {
             result,
             idempotentReplay: false,
           };
         }
 
-        // 5. Atualiza saldo e versão.
+        const balanceDelta = command.kind === 'BET'
+          ? amount.negate().toJSON().amount
+          : normalizedAmount;
+
+        // 5. Atualiza saldo e versão sob o mesmo lock por wallet.
         // O UPDATE mantém uma verificação de saldo
         // no próprio PostgreSQL.
         const updated = await tx.execute<UpdatedWalletRow[]>(
           `
           UPDATE wallets
           SET
-            balance = balance - ?::numeric,
+            balance = balance + ?::numeric,
             version = version + 1,
             updated_at = NOW()
           WHERE id = ?
-            AND balance >= ?::numeric
+            AND balance + ?::numeric >= 0
           RETURNING balance::text AS balance
           `,
           [
-            normalizedAmount,
+            balanceDelta,
             walletId,
-            normalizedAmount,
+            balanceDelta,
           ],
         );
 
@@ -344,7 +432,7 @@ export class BettingService {
           throw new Error('Falha de consistência do saldo');
         }
 
-        // 6. Registra o débito no ledger imutável.
+        // 6. Registra o lançamento correspondente no ledger imutável.
         // Se este INSERT falhar, a transação inteira
         // será revertida pelo PostgreSQL.
         await tx.execute(
@@ -360,7 +448,7 @@ export class BettingService {
             balance_after
           )
           VALUES (
-            ?, ?, ?, 'DEBIT',
+            ?, ?, ?, ?,
             ?::numeric, ?, ?::numeric, ?::numeric
           )
           `,
@@ -368,6 +456,7 @@ export class BettingService {
             randomUUID(),
             walletId,
             transactionId,
+            command.kind === 'BET' ? 'DEBIT' : 'CREDIT',
             normalizedAmount,
             command.currency,
             balanceBefore.toJSON().amount,
@@ -391,7 +480,7 @@ export class BettingService {
     }
   }
 
-  private validateCommand(command: PlaceBetCommand): void {
+  private validateCommand(command: SubmitWagerCommand): void {
     if (
       !command ||
       typeof command.walletId !== 'string' ||
@@ -400,6 +489,21 @@ export class BettingService {
       !UUID_PATTERN.test(command.playerId)
     ) {
       throw new Error('Identificadores inválidos');
+    }
+
+    if (!['BET', 'WIN', 'LOSS'].includes(command.kind)) {
+      throw new Error('Tipo de operação não suportado');
+    }
+
+    if (
+      command.kind === 'WIN' &&
+      command.referenceExternalTransactionId !== undefined &&
+      (
+        typeof command.referenceExternalTransactionId !== 'string' ||
+        command.referenceExternalTransactionId.trim().length === 0
+      )
+    ) {
+      throw new Error('Referência externa inválida');
     }
 
     const requiredFields = [
