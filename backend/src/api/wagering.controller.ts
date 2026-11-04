@@ -83,15 +83,27 @@ export class WageringController {
       });
     }
 
-    if (body.kind !== 'BET' && body.kind !== 'WIN' && body.kind !== 'LOSS') {
+    if (
+      body.kind !== 'BET' && body.kind !== 'WIN' && body.kind !== 'LOSS' &&
+      body.kind !== 'REFUND' && body.kind !== 'ROLLBACK'
+    ) {
       throw new BadRequestException({
         code: 'UNSUPPORTED_TRANSACTION_KIND',
-        message: 'Tipos disponíveis: BET, WIN e LOSS',
+        message: 'Tipos disponíveis: BET, WIN, LOSS, REFUND e ROLLBACK',
+      });
+    }
+
+    const requiresReference = body.kind === 'REFUND' || body.kind === 'ROLLBACK';
+    const acceptsReference = body.kind === 'WIN' || requiresReference;
+    if (requiresReference && body.referenceExternalTransactionId === undefined) {
+      throw new BadRequestException({
+        code: 'MISSING_REFERENCE',
+        message: 'referenceExternalTransactionId é obrigatório para reversões',
       });
     }
 
     if (
-      body.kind === 'WIN' &&
+      acceptsReference &&
       body.referenceExternalTransactionId !== undefined &&
       !isNonEmptyString(body.referenceExternalTransactionId)
     ) {
@@ -169,7 +181,7 @@ export class WageringController {
       idempotencyKey,
       amount,
       currency,
-      ...(body.kind === 'WIN' && body.referenceExternalTransactionId !== undefined
+      ...(acceptsReference && body.referenceExternalTransactionId !== undefined
         ? { referenceExternalTransactionId: body.referenceExternalTransactionId as string }
         : {}),
     };

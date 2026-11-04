@@ -6,7 +6,9 @@ import ormConfig from '../src/mikro-orm.config.js';
 import {
   BettingService,
   type PlaceBetCommand,
+  type SubmitWagerCommand,
 } from '../src/application/services/betting.service.js';
+import { WalletsService } from '../src/application/services/wallets.service.js';
 
 interface WalletRow {
   balance: string;
@@ -44,9 +46,14 @@ describe('BettingService - Rollback financeiro', () => {
   it.each([
     ['BET', '20.00'],
     ['WIN', '180.00'],
+    ['REFUND', '100.00'],
+    ['ROLLBACK', '100.00'],
   ] as const)('deve desfazer tudo se o ledger de %s falhar', async (kind, finalBalance) => {
-    const walletId = randomUUID();
     const playerId = randomUUID();
+    const { id: walletId } = await new WalletsService(orm.em.fork()).open({
+      playerId,
+      initialBalance: { amount: '100.00', currency: 'BRL' },
+    });
 
     const command: PlaceBetCommand = {
       walletId,
@@ -62,16 +69,17 @@ describe('BettingService - Rollback financeiro', () => {
 
     const db = orm.em.fork();
 
-    // Carteira criada e confirmada antes do teste.
-    await db.execute(
-      `
-      INSERT INTO wallets (
-        id, player_id, currency, balance
-      )
-      VALUES (?, ?, 'BRL', 100.00)
-      `,
-      [walletId, playerId],
-    );
+    const isReversal = kind === 'REFUND' || kind === 'ROLLBACK';
+    let referenceExternalTransactionId: string | undefined;
+    if (isReversal) {
+      referenceExternalTransactionId = randomUUID();
+      await new BettingService(orm.em.fork()).placeBet({
+        ...command,
+        externalTransactionId: referenceExternalTransactionId,
+        idempotencyKey: randomUUID(),
+      });
+    }
+    const operation: SubmitWagerCommand = { ...command, kind, referenceExternalTransactionId };
 
     // Identificadores únicos para evitar colisões
     // com outros testes no mesmo banco.
@@ -117,7 +125,7 @@ describe('BettingService - Rollback financeiro', () => {
       let capturedError: unknown;
 
       try {
-        await service.submitTransaction({ ...command, kind });
+        await service.submitTransaction(operation);
       } catch (error) {
         capturedError = error;
       }
@@ -145,9 +153,9 @@ describe('BettingService - Rollback financeiro', () => {
 
       expect(wallets).toHaveLength(1);
 
-      // O débito anterior à falha deve ser desfeito.
-      expect(wallets[0].balance).toBe('100.00');
-      expect(wallets[0].version).toBe('1');
+      // A movimentação anterior à falha deve ser desfeita.
+      expect(wallets[0].balance).toBe(isReversal ? '20.00' : '100.00');
+      expect(wallets[0].version).toBe(isReversal ? '2' : '1');
 
       const transactions = await verify.execute<CountRow[]>(
         `
@@ -170,7 +178,7 @@ describe('BettingService - Rollback financeiro', () => {
         [walletId],
       );
 
-      expect(ledger[0].total).toBe(0);
+      expect(ledger[0].total).toBe(isReversal ? 2 : 1);
     } finally {
       // Remove a falha injetada mesmo se o teste falhar.
       // Nunca remove os triggers reais de imutabilidade.
@@ -193,7 +201,7 @@ describe('BettingService - Rollback financeiro', () => {
     // consumido a chave de idempotência.
     const retryService = new BettingService(orm.em.fork());
 
-    const { result } = await retryService.submitTransaction({ ...command, kind });
+    const { result } = await retryService.submitTransaction(operation);
 
     expect(result.status).toBe('PROCESSED');
     expect(result.balance).toBe(finalBalance);
@@ -213,7 +221,7 @@ describe('BettingService - Rollback financeiro', () => {
     );
 
     expect(wallets[0].balance).toBe(finalBalance);
-    expect(wallets[0].version).toBe('2');
+    expect(wallets[0].version).toBe(isReversal ? '3' : '2');
 
     const ledger = await verify.execute<CountRow[]>(
       `
@@ -224,6 +232,13 @@ describe('BettingService - Rollback financeiro', () => {
       [walletId],
     );
 
-    expect(ledger[0].total).toBe(1);
+    expect(ledger[0].total).toBe(isReversal ? 3 : 2);
+
+    const calculated = await verify.execute<Array<{ balance: string }>>(`
+      SELECT SUM(CASE WHEN direction = 'CREDIT' THEN amount ELSE -amount END)
+        ::numeric(20, 2)::text AS balance
+      FROM wallet_ledger_entries WHERE wallet_id = ?
+    `, [walletId]);
+    expect(calculated[0].balance).toBe(finalBalance);
   }, 30000);
 });

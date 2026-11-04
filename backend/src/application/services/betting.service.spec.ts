@@ -53,7 +53,7 @@ describe('BettingService - Contrato obrigatório', () => {
     }
   }
 
-  for (const kind of ['OPENING', 'REFUND', 'ROLLBACK']) {
+  for (const kind of ['OPENING', 'UNKNOWN']) {
     it(`rejeita ${kind} antes de iniciar uma transação`, async () => {
       const transactional = vi.fn();
       const service = new BettingService({ transactional } as unknown as EntityManager);
@@ -73,5 +73,21 @@ describe('BettingService - Contrato obrigatório', () => {
       await expect(service.submitTransaction(command)).rejects.toThrow('Referência externa inválida');
       expect(transactional).not.toHaveBeenCalled();
     });
+  }
+
+  for (const kind of ['REFUND', 'ROLLBACK'] as const) {
+    for (const reference of [undefined, null, '', '   ']) {
+      it(`rejeita ${kind} sem referência válida antes de acessar o banco: ${JSON.stringify(reference)}`, async () => {
+        const transactional = vi.fn();
+        const service = new BettingService({ transactional } as unknown as EntityManager);
+        const command = {
+          ...validCommand, kind, referenceExternalTransactionId: reference,
+        } as SubmitWagerCommand;
+        await expect(service.submitTransaction(command)).rejects.toThrow(
+          reference === undefined ? 'Referência externa obrigatória' : 'Referência externa inválida',
+        );
+        expect(transactional).not.toHaveBeenCalled();
+      });
+    }
   }
 });

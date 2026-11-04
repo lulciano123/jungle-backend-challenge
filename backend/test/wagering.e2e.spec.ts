@@ -404,7 +404,7 @@ describe('WageringController (e2e)', () => {
     const { playerId, walletId } = await createWallet();
     const payload = {
       ...makeBet(playerId, walletId),
-      kind: 'REFUND',
+      kind: 'OPENING',
     };
 
     const response = await request(app.getHttpServer())

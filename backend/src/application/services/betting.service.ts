@@ -18,7 +18,7 @@ export interface PlaceBetCommand {
   gameId: string;
 }
 
-export type WagerKind = 'BET' | 'WIN' | 'LOSS';
+export type WagerKind = 'BET' | 'WIN' | 'LOSS' | 'REFUND' | 'ROLLBACK';
 
 export interface SubmitWagerCommand extends PlaceBetCommand {
   kind: WagerKind;
@@ -62,6 +62,8 @@ interface ReferenceTransactionRow {
   currency: string;
   round_id: string | null;
   kind: string;
+  status: string;
+  amount: string;
 }
 
 const UUID_PATTERN =
@@ -149,7 +151,8 @@ export class BettingService {
     }
 
     const normalizedAmount = amount.toJSON().amount;
-    const referenceExternalTransactionId = command.kind === 'WIN'
+    const isReversal = command.kind === 'REFUND' || command.kind === 'ROLLBACK';
+    const referenceExternalTransactionId = command.kind === 'WIN' || isReversal
       ? command.referenceExternalTransactionId
       : undefined;
 
@@ -274,11 +277,15 @@ export class BettingService {
         let failureCode: string | null = null;
         let referenceTransactionId: string | null = null;
         let balanceAfter = balanceBefore;
+        let direction: 'DEBIT' | 'CREDIT' | null = command.kind === 'BET'
+          ? 'DEBIT'
+          : command.kind === 'WIN' || command.kind === 'REFUND' ? 'CREDIT' : null;
 
         if (referenceExternalTransactionId !== undefined) {
           const references = await tx.execute<ReferenceTransactionRow[]>(
             `
-            SELECT id, player_id, wallet_id, currency, round_id, kind
+            SELECT id, player_id, wallet_id, currency, round_id, kind, status,
+              amount::text AS amount
             FROM wager_transactions
             WHERE provider_id = ? AND external_transaction_id = ?
             `,
@@ -290,8 +297,11 @@ export class BettingService {
             status = 'PENDING_REFERENCE';
           } else {
             referenceTransactionId = reference.id;
+            const allowedReferenceKinds = command.kind === 'ROLLBACK'
+              ? ['BET', 'WIN', 'REFUND']
+              : ['BET'];
 
-            if (reference.kind !== 'BET') {
+            if (!allowedReferenceKinds.includes(reference.kind)) {
               status = 'REJECTED';
               failureCode = 'INVALID_REFERENCE_KIND';
             } else if (
@@ -302,18 +312,42 @@ export class BettingService {
             ) {
               status = 'REJECTED';
               failureCode = 'REFERENCE_MISMATCH';
+            } else if (isReversal && reference.status !== 'PROCESSED') {
+              status = 'REJECTED';
+              failureCode = 'REFERENCE_NOT_PROCESSED';
+            } else if (isReversal && !amount.equals(Money.from({
+              amount: reference.amount,
+              currency: reference.currency,
+            }))) {
+              status = 'REJECTED';
+              failureCode = 'REFERENCE_AMOUNT_MISMATCH';
+            } else if (isReversal) {
+              // A wallet permanece bloqueada durante a decisão e a gravação.
+              // O índice único limita a uma reversão PROCESSED por referência e tipo.
+              const reversals = await tx.execute<Array<{ id: string }>>(`
+                SELECT id FROM wager_transactions
+                WHERE reference_transaction_id = ? AND kind = ? AND status = 'PROCESSED'
+                LIMIT 1
+              `, [reference.id, command.kind]);
+
+              if (reversals.length > 0) {
+                status = 'REJECTED';
+                failureCode = 'REFERENCE_ALREADY_REVERSED';
+              } else if (command.kind === 'ROLLBACK') {
+                direction = reference.kind === 'BET' ? 'CREDIT' : 'DEBIT';
+              }
             }
           }
         }
 
-        if (status === 'PROCESSED' && command.kind === 'BET') {
+        if (status === 'PROCESSED' && direction === 'DEBIT') {
           if (balanceBefore.isLessThan(amount)) {
             status = 'REJECTED';
-            failureCode = 'INSUFFICIENT_FUNDS';
+            failureCode = isReversal ? 'REVERSAL_INSUFFICIENT_FUNDS' : 'INSUFFICIENT_FUNDS';
           } else {
             balanceAfter = balanceBefore.subtract(amount);
           }
-        } else if (status === 'PROCESSED' && command.kind === 'WIN') {
+        } else if (status === 'PROCESSED' && direction === 'CREDIT') {
           try {
             balanceAfter = balanceBefore.add(amount);
           } catch (error) {
@@ -393,14 +427,14 @@ export class BettingService {
         );
 
         // LOSS, rejeições e referências pendentes não alteram saldo ou versão.
-        if (status !== 'PROCESSED' || command.kind === 'LOSS') {
+        if (status !== 'PROCESSED' || direction === null) {
           return {
             result,
             idempotentReplay: false,
           };
         }
 
-        const balanceDelta = command.kind === 'BET'
+        const balanceDelta = direction === 'DEBIT'
           ? amount.negate().toJSON().amount
           : normalizedAmount;
 
@@ -456,7 +490,7 @@ export class BettingService {
             randomUUID(),
             walletId,
             transactionId,
-            command.kind === 'BET' ? 'DEBIT' : 'CREDIT',
+            direction,
             normalizedAmount,
             command.currency,
             balanceBefore.toJSON().amount,
@@ -491,12 +525,17 @@ export class BettingService {
       throw new Error('Identificadores inválidos');
     }
 
-    if (!['BET', 'WIN', 'LOSS'].includes(command.kind)) {
+    if (!['BET', 'WIN', 'LOSS', 'REFUND', 'ROLLBACK'].includes(command.kind)) {
       throw new Error('Tipo de operação não suportado');
     }
 
+    const isReversal = command.kind === 'REFUND' || command.kind === 'ROLLBACK';
+    if (isReversal && command.referenceExternalTransactionId === undefined) {
+      throw new Error('Referência externa obrigatória');
+    }
+
     if (
-      command.kind === 'WIN' &&
+      (command.kind === 'WIN' || isReversal) &&
       command.referenceExternalTransactionId !== undefined &&
       (
         typeof command.referenceExternalTransactionId !== 'string' ||
