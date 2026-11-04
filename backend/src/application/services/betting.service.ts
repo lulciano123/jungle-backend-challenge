@@ -13,6 +13,11 @@ export interface PlaceBetCommand {
   idempotencyKey: string;
   amount: string;
   currency: string;
+
+  // Obrigatórios na futura API HTTP.
+  // Temporariamente opcionais para preservar os testes antigos.
+  roundId?: string;
+  gameId?: string;
 }
 
 export interface PlaceBetResult {
@@ -21,6 +26,11 @@ export interface PlaceBetResult {
   balance: string;
   currency: string;
   failureCode: string | null;
+}
+
+export interface PlaceBetExecution {
+  result: PlaceBetResult;
+  idempotentReplay: boolean;
 }
 
 interface WalletRow {
@@ -47,7 +57,6 @@ const IDEMPOTENCY_CONSTRAINTS = new Set([
   'wager_transactions_provider_external_unique',
 ]);
 
-// Erro de domínio estável, independente do PostgreSQL.
 export class IdempotencyConflictError extends Error {
   readonly code = 'IDEMPOTENCY_CONFLICT';
 
@@ -57,8 +66,6 @@ export class IdempotencyConflictError extends Error {
   }
 }
 
-// Identifica exclusivamente violações das duas
-// restrições de unicidade relacionadas à idempotência.
 function isIdempotencyUniqueViolation(error: unknown): boolean {
   if (!(error instanceof UniqueConstraintViolationException)) {
     return false;
@@ -87,8 +94,6 @@ function isIdempotencyUniqueViolation(error: unknown): boolean {
     return true;
   }
 
-  // Compatibilidade caso o driver exponha somente
-  // a mensagem, sem a propriedade constraint.
   return [...IDEMPOTENCY_CONSTRAINTS].some((name) =>
     error.message.includes(`constraint "${name}"`),
   );
@@ -98,7 +103,17 @@ function isIdempotencyUniqueViolation(error: unknown): boolean {
 export class BettingService {
   constructor(private readonly em: EntityManager) {}
 
+  // Compatibilidade com os testes financeiros existentes.
   async placeBet(command: PlaceBetCommand): Promise<PlaceBetResult> {
+    const execution = await this.placeBetWithMetadata(command);
+    return execution.result;
+  }
+
+  // A futura API HTTP utilizará este método para saber
+  // se a resposta veio de uma execução nova ou de replay.
+  async placeBetWithMetadata(
+    command: PlaceBetCommand,
+  ): Promise<PlaceBetExecution> {
     this.validateCommand(command);
 
     const amount = Money.from({
@@ -110,27 +125,29 @@ export class BettingService {
       throw new Error('A aposta deve ter valor positivo');
     }
 
-    // Hash determinístico dos dados da operação.
-    // A chave de idempotência não faz parte do hash.
+    const normalizedAmount = amount.toJSON().amount;
+
+    // JSON canônico com chaves em ordem fixa.
+    // Não inclui o header de idempotência.
+    const canonicalPayload = {
+      amount: normalizedAmount,
+      currency: command.currency,
+      externalTransactionId: command.externalTransactionId,
+      gameId: command.gameId ?? null,
+      kind: 'BET',
+      playerId: command.playerId,
+      providerId: command.providerId,
+      roundId: command.roundId ?? null,
+      walletId: command.walletId,
+    };
+
     const payloadHash = createHash('sha256')
-      .update(
-        JSON.stringify({
-          walletId: command.walletId,
-          playerId: command.playerId,
-          providerId: command.providerId,
-          externalTransactionId: command.externalTransactionId,
-          amount: amount.toJSON().amount,
-          currency: command.currency,
-        }),
-      )
+      .update(JSON.stringify(canonicalPayload))
       .digest('hex');
 
     try {
-      // O try/catch fica FORA da transação.
-      // Assim, qualquer erro SQL provoca rollback
-      // antes de ser convertido em erro de domínio.
       return await this.em.transactional(async (tx) => {
-        // 1. Bloqueia a carteira durante a transação.
+        // 1. Bloqueia exclusivamente a carteira afetada.
         const wallets = await tx.execute<WalletRow[]>(
           `
           SELECT
@@ -159,7 +176,7 @@ export class BettingService {
           throw new Error('Moeda incompatível com a carteira');
         }
 
-        // 2. Verifica transações anteriores.
+        // 2. Consulta a idempotência persistente.
         const previous = await tx.execute<ExistingTransactionRow[]>(
           `
           SELECT payload_hash, original_response
@@ -189,22 +206,22 @@ export class BettingService {
           const originalResponse = previous[0].original_response;
 
           if (!originalResponse) {
-            throw new Error(
-              'Transação anterior ainda não finalizada',
-            );
+            throw new Error('Transação anterior ainda não finalizada');
           }
 
-          // Replay: retorna a resposta original
-          // sem alterar saldo nem criar ledger.
-          return originalResponse;
+          // Não modifica o saldo e não gera outro ledger.
+          return {
+            result: originalResponse,
+            idempotentReplay: true,
+          };
         }
 
+        // 3. Avalia o saldo disponível.
         const balanceBefore = Money.from({
           amount: wallet.balance,
           currency: wallet.currency,
         });
 
-        // 3. Calcula o resultado da aposta.
         const approved = !balanceBefore.isLessThan(amount);
 
         const balanceAfter = approved
@@ -221,7 +238,7 @@ export class BettingService {
           failureCode: approved ? null : 'INSUFFICIENT_FUNDS',
         };
 
-        // 4. Registra a decisão e a resposta original.
+        // 4. Persiste a transação e a resposta original.
         await tx.execute(
           `
           INSERT INTO wager_transactions (
@@ -232,6 +249,8 @@ export class BettingService {
             external_transaction_id,
             idempotency_key,
             payload_hash,
+            round_id,
+            game_id,
             kind,
             status,
             amount,
@@ -242,7 +261,7 @@ export class BettingService {
             processed_at
           )
           VALUES (
-            ?, ?, ?, ?, ?, ?, ?,
+            ?, ?, ?, ?, ?, ?, ?, ?, ?,
             'BET', ?, ?::numeric, ?, ?,
             ?::numeric, ?::jsonb, NOW()
           )
@@ -255,8 +274,10 @@ export class BettingService {
             command.externalTransactionId,
             command.idempotencyKey,
             payloadHash,
+            command.roundId ?? null,
+            command.gameId ?? null,
             result.status,
-            amount.toJSON().amount,
+            normalizedAmount,
             command.currency,
             result.failureCode,
             result.balance,
@@ -264,13 +285,16 @@ export class BettingService {
           ],
         );
 
-        // Rejeição por saldo insuficiente:
-        // persiste a decisão, mas não gera débito.
+        // A rejeição por saldo insuficiente também é
+        // persistida, mas não altera saldo nem ledger.
         if (!approved) {
-          return result;
+          return {
+            result,
+            idempotentReplay: false,
+          };
         }
 
-        // 5. Atualiza saldo sob o mesmo bloqueio SQL.
+        // 5. Atualiza saldo e versão atomicamente.
         const updated = await tx.execute<UpdatedWalletRow[]>(
           `
           UPDATE wallets
@@ -283,9 +307,9 @@ export class BettingService {
           RETURNING balance::text AS balance
           `,
           [
-            amount.toJSON().amount,
+            normalizedAmount,
             command.walletId,
-            amount.toJSON().amount,
+            normalizedAmount,
           ],
         );
 
@@ -296,7 +320,7 @@ export class BettingService {
           throw new Error('Falha de consistência do saldo');
         }
 
-        // 6. Insere o lançamento financeiro imutável.
+        // 6. Registra o lançamento imutável.
         await tx.execute(
           `
           INSERT INTO wallet_ledger_entries (
@@ -318,25 +342,24 @@ export class BettingService {
             randomUUID(),
             command.walletId,
             transactionId,
-            amount.toJSON().amount,
+            normalizedAmount,
             command.currency,
             balanceBefore.toJSON().amount,
             result.balance,
           ],
         );
 
-        // O MikroORM confirma a transação
-        // somente após a conclusão do callback.
-        return result;
+        return {
+          result,
+          idempotentReplay: false,
+        };
       });
     } catch (error) {
-      // O rollback já ocorreu quando chegamos aqui.
+      // Este tratamento ocorre após o rollback.
       if (isIdempotencyUniqueViolation(error)) {
         throw new IdempotencyConflictError();
       }
 
-      // Não mascara erros de conexão, SQL, FK,
-      // constraints monetárias ou outras falhas.
       throw error;
     }
   }
@@ -362,10 +385,21 @@ export class BettingService {
       requiredFields.some(
         (value) =>
           typeof value !== 'string' ||
-          value.trim().length === 0,
+          value.trim().length === 0
       )
     ) {
       throw new Error('Identificadores da operação inválidos');
+    }
+
+    // Os campos são opcionais somente para compatibilidade
+    // com os testes antigos. A API HTTP os exigirá.
+    for (const value of [command.roundId, command.gameId]) {
+      if (
+        value !== undefined &&
+        (typeof value !== 'string' || value.trim().length === 0)
+      ) {
+        throw new Error('Identificador da rodada ou jogo inválido');
+      }
     }
   }
 }

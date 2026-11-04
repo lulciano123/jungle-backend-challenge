@@ -1,3 +1,4 @@
+
 import { Module } from '@nestjs/common';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { MikroOrmModule } from '@mikro-orm/nestjs';
@@ -7,6 +8,7 @@ import { HealthController } from './health.controller.js';
 import { AppController } from './app.controller.js';
 import { AppService } from './app.service.js';
 import { WalletsModule } from './api/wallets.module.js';
+import { WageringModule } from './api/wagering.module.js';
 
 @Module({
   imports: [
@@ -31,15 +33,14 @@ import { WalletsModule } from './api/wallets.module.js';
         metadataProvider: ReflectMetadataProvider,
         autoLoadEntities: true,
 
-        // Temporário: ainda não criamos entidades ORM.
         discovery: {
           warnWhenNoEntities: false,
         },
       }),
     }),
 
-    // Registra os endpoints e o serviço de carteiras.
     WalletsModule,
+    WageringModule,
   ],
 
   controllers: [AppController, HealthController],
