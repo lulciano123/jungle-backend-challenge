@@ -6,6 +6,7 @@ import { ReflectMetadataProvider } from '@mikro-orm/decorators/legacy';
 import { HealthController } from './health.controller.js';
 import { AppController } from './app.controller.js';
 import { AppService } from './app.service.js';
+import { WalletsModule } from './api/wallets.module.js';
 
 @Module({
   imports: [
@@ -30,12 +31,15 @@ import { AppService } from './app.service.js';
         metadataProvider: ReflectMetadataProvider,
         autoLoadEntities: true,
 
-        // Temporário: ainda não criamos entidades.
+        // Temporário: ainda não criamos entidades ORM.
         discovery: {
           warnWhenNoEntities: false,
         },
       }),
     }),
+
+    // Registra os endpoints e o serviço de carteiras.
+    WalletsModule,
   ],
 
   controllers: [AppController, HealthController],
