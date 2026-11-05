@@ -110,47 +110,23 @@ Em falha durante shutdown, o consumidor tenta devolver a visibilidade; se o
 processo for morto, a visibilidade ou o lease expiram. Nenhuma garantia depende
 de estado em memória. Workers de referências pendentes ficam fora desta etapa.
 
-## Inventário desta etapa
 
-Arquivos existentes alterados:
+## Componentes principais
 
-```text
-backend/.env.example
-backend/bun.lock
-backend/package.json
-backend/src/api/wagering.controller.ts
-backend/src/application/services/betting.service.ts
-backend/src/application/services/wallets.service.ts
-backend/src/health.controller.ts
-backend/src/main.ts
-infra/compose.yaml
-```
+A implementação da mensageria está organizada nos seguintes componentes:
 
-Arquivos novos:
+| Componente | Localização |
+|---|---|
+| Infraestrutura Docker | `infra/compose.yaml` |
+| Inicialização das filas | `infra/init-sqs.sh` |
+| Configuração do cliente SQS | `backend/src/infrastructure/sqs/sqs-config.ts` |
+| Consumidor SQS | `backend/src/infrastructure/sqs/wager-consumer.ts` |
+| Processamento da Inbox | `backend/src/application/messaging/inbox-processor.ts` |
+| Publicação da Outbox | `backend/src/infrastructure/outbox/outbox-publisher.ts` |
+| Eventos de integração | `backend/src/domain/events/integration-event.ts` |
+| Migration de mensageria | `backend/src/migrations/Migration20261104000002.ts` |
+| Testes distribuídos | `backend/distributed-test/` |
 
-```text
-backend/src/migrations/Migration20261104000002.ts
-backend/src/application/messaging/inbox-processor.ts
-backend/src/application/messaging/parse-wager-command.ts
-backend/src/application/messaging/wager-request.ts
-backend/src/application/messaging/wager-request.spec.ts
-backend/src/application/messaging/write-events.ts
-backend/src/domain/events/integration-event.ts
-backend/src/domain/events/integration-event.spec.ts
-backend/src/infrastructure/outbox/outbox-publisher.ts
-backend/src/infrastructure/sqs/init-queues.ts
-backend/src/infrastructure/sqs/sqs-config.ts
-backend/src/infrastructure/sqs/wager-consumer.ts
-backend/src/workers/consumer.ts
-backend/src/workers/init-queues.ts
-backend/src/workers/migrate-test.ts
-backend/src/workers/publisher.ts
-backend/src/workers/runtime.ts
-backend/test/messaging-atomicity.spec.ts
-backend/test/support/messaging.ts
-backend/distributed-test/messaging.spec.ts
-backend/distributed-test/support/sqs.ts
-backend/distributed-test/support/worker-process.ts
-infra/init-sqs.sh
-infra/MESSAGING.md
-```
+Para uma visão geral da aplicação e das decisões arquiteturais, consulte [ARCHITECTURE.md](../ARCHITECTURE.md).
+
+Para instalação, exemplos HTTP e execução completa do projeto, consulte [README.md](../README.md).
