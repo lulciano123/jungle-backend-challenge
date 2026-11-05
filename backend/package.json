@@ -14,14 +14,20 @@
     "start:dev": "nest start --watch",
     "start:debug": "nest start --debug --watch",
     "start:prod": "bun dist/main.js",
-    "lint": "oxlint --type-aware src/ test/",
+    "lint": "oxlint --type-aware src/ test/ distributed-test/",
     "test": "bun test src/",
     "test:watch": "bun test --watch src/",
     "test:cov": "bun test --coverage src/",
     "test:debug": "bun test --inspect-brk src/",
-    "test:e2e": "bun test test/"
+    "test:e2e": "bun test ./test/",
+    "start:consumer": "bun dist/workers/consumer.js",
+    "start:publisher": "bun dist/workers/publisher.js",
+    "queues:init": "bun src/workers/init-queues.ts",
+    "db:migrate:test": "bun src/workers/migrate-test.ts",
+    "test:distributed": "bun test ./distributed-test/ --timeout 60000"
   },
   "dependencies": {
+    "@aws-sdk/client-sqs": "^3.1162.0",
     "@mikro-orm/core": "7",
     "@mikro-orm/decorators": "7",
     "@mikro-orm/migrations": "7",

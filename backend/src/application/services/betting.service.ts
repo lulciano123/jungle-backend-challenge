@@ -4,6 +4,12 @@ import { UniqueConstraintViolationException } from '@mikro-orm/core';
 import { EntityManager } from '@mikro-orm/postgresql';
 import { Injectable } from '@nestjs/common';
 import { Money } from '../../domain/value-objects/money.js';
+import {
+  WagerTransactionProcessed, WagerTransactionRejected,
+  WagerTransactionPendingReference, WalletBalanceChanged,
+  type EventContext, type WagerTransactionData,
+} from '../../domain/events/integration-event.js';
+import { writeEvents } from '../messaging/write-events.js';
 
 export interface PlaceBetCommand {
   walletId: string;
@@ -53,6 +59,7 @@ interface ExistingTransactionRow {
 
 interface UpdatedWalletRow {
   balance: string;
+  version: string;
 }
 
 interface ReferenceTransactionRow {
@@ -133,8 +140,24 @@ export class BettingService {
     return this.submitTransaction({ ...command, kind: 'BET' });
   }
 
-  async submitTransaction(
+  async submitTransaction(command: SubmitWagerCommand): Promise<PlaceBetExecution> {
+    return this.execute(command);
+  }
+
+  // The Inbox owns the commit. This method never starts a nested transaction.
+  async submitTransactionInTransaction(
+    tx: EntityManager,
     command: SubmitWagerCommand,
+    context: EventContext,
+  ): Promise<PlaceBetExecution> {
+    if (!tx.isInTransaction()) throw new Error('Financial processing requires an active SQL transaction');
+    return this.execute(command, tx, context);
+  }
+
+  private async execute(
+    command: SubmitWagerCommand,
+    transaction?: EntityManager,
+    context?: EventContext,
   ): Promise<PlaceBetExecution> {
     this.validateCommand(command);
 
@@ -179,7 +202,7 @@ export class BettingService {
       .digest('hex');
 
     try {
-      return await this.em.transactional(async (tx) => {
+      const operation = async (tx: EntityManager): Promise<PlaceBetExecution> => {
         // 1. Bloqueia a carteira afetada.
         // Isso serializa movimentações concorrentes
         // sobre a mesma linha no PostgreSQL.
@@ -426,8 +449,25 @@ export class BettingService {
           ],
         );
 
+        const eventContext = context ?? { correlationId: command.idempotencyKey };
+        const eventData: WagerTransactionData = {
+          transactionId, walletId, playerId,
+          providerId: command.providerId,
+          externalTransactionId: command.externalTransactionId,
+          roundId: command.roundId, gameId: command.gameId, kind: command.kind,
+          money: amount.toJSON(),
+          balance: { amount: result.balance, currency: result.currency },
+          referenceExternalTransactionId: referenceExternalTransactionId ?? null,
+        };
+        const transactionEvent = status === 'PROCESSED'
+          ? WagerTransactionProcessed.from(eventData, eventContext)
+          : status === 'PENDING_REFERENCE'
+            ? WagerTransactionPendingReference.from(eventData, eventContext)
+            : WagerTransactionRejected.from({ ...eventData, failureCode: failureCode! }, eventContext);
+
         // LOSS, rejeições e referências pendentes não alteram saldo ou versão.
         if (status !== 'PROCESSED' || direction === null) {
+          await writeEvents(tx, [transactionEvent]);
           return {
             result,
             idempotentReplay: false,
@@ -450,7 +490,7 @@ export class BettingService {
             updated_at = NOW()
           WHERE id = ?
             AND balance + ?::numeric >= 0
-          RETURNING balance::text AS balance
+          RETURNING balance::text AS balance, version::text AS version
           `,
           [
             balanceDelta,
@@ -498,13 +538,24 @@ export class BettingService {
           ],
         );
 
+        await writeEvents(tx, [
+          transactionEvent,
+          WalletBalanceChanged.from({
+            walletId, transactionId, direction, money: amount.toJSON(),
+            balanceBefore: balanceBefore.toJSON(),
+            balanceAfter: { amount: result.balance, currency: result.currency },
+            walletVersion: updated[0].version,
+          }, eventContext),
+        ]);
+
         return {
           result,
           idempotentReplay: false,
         };
-      });
+      };
+      return await (transaction ? operation(transaction) : this.em.transactional(operation));
     } catch (error) {
-      // Executado depois do rollback transacional.
+      // The transaction owner rolls back before handling this error.
       if (isIdempotencyUniqueViolation(error)) {
         throw new IdempotencyConflictError();
       }

@@ -6,6 +6,7 @@ import {
 } from '@nestjs/common';
 
 import { MikroORM } from '@mikro-orm/core';
+import { createSqsClient, resolveQueues } from './infrastructure/sqs/sqs-config.js';
 
 @Controller('health')
 export class HealthController {
@@ -20,10 +21,10 @@ export class HealthController {
     };
   }
 
-  // Readiness: verifica se o PostgreSQL
-  // está disponível para operações.
+  // Readiness includes the broker without coupling HTTP commits to SQS availability.
   @Get('ready')
   async checkReadiness() {
+    let database: 'up' | 'down' = 'down';
     try {
       const rows = await this.orm.em
         .getConnection()
@@ -32,15 +33,20 @@ export class HealthController {
       if (rows[0]?.ok !== 1) {
         throw new Error('Database check failed');
       }
+      database = 'up';
+      const client = createSqsClient();
+      try { await resolveQueues(client); } finally { client.destroy(); }
 
       return {
         status: 'ok',
         database: 'up',
+        sqs: 'up',
       };
     } catch {
       throw new ServiceUnavailableException({
         status: 'unavailable',
-        database: 'down',
+        database,
+        sqs: database === 'up' ? 'down' : 'unknown',
       });
     }
   }

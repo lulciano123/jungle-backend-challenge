@@ -22,5 +22,27 @@ services:
       timeout: 3s
       retries: 10
 
+  ministack:
+    image: ${MINISTACK_IMAGE:-ministackorg/ministack:1.5.36}
+    restart: unless-stopped
+    environment:
+      SERVICES: sqs
+      MINISTACK_REGION: us-east-1
+      MINISTACK_ACCOUNT_ID: "000000000000"
+      PERSIST_STATE: "1"
+      STATE_DIR: /var/lib/ministack
+    ports:
+      - "127.0.0.1:4566:4566"
+    volumes:
+      - sqs_data:/var/lib/ministack
+      - ./init-sqs.sh:/etc/localstack/init/ready.d/10-init-sqs.sh:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:4566/_ministack/health', timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+
 volumes:
   postgres_data:
+  sqs_data:

@@ -3,6 +3,8 @@ import { UniqueConstraintViolationException } from '@mikro-orm/core';
 import { EntityManager } from '@mikro-orm/postgresql';
 import { Injectable } from '@nestjs/common';
 import { Wallet } from '../../domain/entities/wallet.js';
+import { WagerTransactionProcessed, WalletBalanceChanged } from '../../domain/events/integration-event.js';
+import { writeEvents } from '../messaging/write-events.js';
 import {
   Money,
   type MoneyProps,
@@ -201,6 +203,21 @@ export class WalletsService {
             money.amount,
           ],
         );
+
+        const context = { correlationId: openingReference };
+        await writeEvents(tx, [
+          WagerTransactionProcessed.from({
+            transactionId, walletId: wallet.id, playerId: wallet.playerId,
+            providerId: '__internal__', externalTransactionId: openingReference,
+            roundId: null, gameId: null, kind: 'OPENING', money,
+            balance: money, referenceExternalTransactionId: null,
+          }, context),
+          WalletBalanceChanged.from({
+            walletId: wallet.id, transactionId, direction: 'CREDIT', money,
+            balanceBefore: { amount: '0.00', currency: money.currency },
+            balanceAfter: money, walletVersion: String(wallet.version),
+          }, context),
+        ]);
 
         // Se qualquer INSERT falhar, a criação
         // da carteira também será revertida.

@@ -26,3 +26,22 @@ coverage/
 
 # Cache incremental do TypeScript
 *.tsbuildinfo
+
+# Credenciais privadas e dados locais de infraestrutura
+.aws/
+**/.aws/
+*.pem
+*.key
+*.p12
+*.pfx
+pgdata/
+postgres_data/
+ministack-state/
+sqs_data/
+backups/
+dumps/
+*.dump
+*.backup
+*.swp
+*.swo
+*.orig
