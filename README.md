@@ -1,249 +1,721 @@
+
 # Jungle Gaming — Distributed Wagering Processor
 
-Implementação do [desafio Backend da Jungle Gaming](https://github.com/junglegaming/backend-challenge).
-A entrega cobre o processamento financeiro HTTP/SQS com PostgreSQL como autoridade.
-**Não implementa integralmente o edital**: veja a matriz e [ARCHITECTURE.md](ARCHITECTURE.md).
+Implementação do [Backend Challenge da Jungle Gaming](https://github.com/junglegaming/backend-challenge), utilizando **Bun, NestJS, TypeScript, PostgreSQL e AWS SQS via MiniStack**.
 
-## Tecnologias e organização
+O projeto implementa um serviço de processamento financeiro de apostas com API HTTP, consumidores de mensagens e publicação assíncrona de eventos. O foco está na integridade monetária, consistência transacional, idempotência persistente, concorrência entre instâncias e recuperação após falhas.
 
-Bun 1.x, TypeScript strict/ESM, NestJS, PostgreSQL 17, MikroORM 7, decimal.js,
-AWS SDK v3 e MiniStack 1.5.36. API, consumidor e publisher são processos separados.
-`backend/src/domain` contém VOs, entidades e eventos; `application`, serviços e
-Inbox; `api`, controllers; `infrastructure`, adapters SQS/Outbox; `workers`, entrypoints.
-A persistência financeira usa SQL parametrizado nas transações do MikroORM.
+O PostgreSQL é a fonte de verdade para saldos, transações, ledger, Inbox e Outbox.
 
-## Pré-requisitos
+A implementação cobre o núcleo financeiro e a infraestrutura distribuída do desafio. As funcionalidades não concluídas estão identificadas na seção [Escopo e limitações](#escopo-e-limitações).
 
-- Bun 1.x no PATH (validado com 1.4.4).
-- Node.js compatível com o Nest CLI (validado com 22.22.3).
-- Docker e Docker Compose com acesso autorizado ao daemon.
-- Portas locais 5433, 4566 e 3000 disponíveis; curl para os exemplos.
-- Não é necessária conta AWS, AWS CLI ou credencial paga.
+## 1. Visão geral
 
-## Ambiente e infraestrutura
+O sistema recebe operações financeiras de provedores de jogos e aplica seus efeitos sobre carteiras de jogadores.
 
-Na raiz, copie o exemplo **somente se o arquivo local ainda não existir**:
+As operações podem chegar pela API HTTP ou por mensagens SQS. Ambos os caminhos compartilham o mesmo processamento financeiro e as garantias de persistência.
 
-```sh
+### Operações suportadas
+
+| Operação | Efeito no saldo | Ledger | Comportamento |
+|---|---|---|---|
+| `OPENING` | Crédito inicial | `CREDIT` | Operação interna de abertura de carteira |
+| `BET` | Débito | `DEBIT` | Rejeita apostas sem saldo suficiente |
+| `WIN` | Crédito | `CREDIT` | Registra o pagamento de uma vitória |
+| `LOSS` | Nenhum | Nenhum | Registra o resultado sem movimentar saldo |
+| `REFUND` | Crédito | `CREDIT` | Devolve integralmente uma `BET` processada |
+| `ROLLBACK` | Movimento inverso | `DEBIT` ou `CREDIT` | Reverte uma operação financeira processada |
+
+As operações `REFUND` e `ROLLBACK` exigem uma referência válida, respeitam o valor integral da transação original e possuem proteção contra reversões duplicadas.
+
+Operações com referência ainda inexistente são registradas como `PENDING_REFERENCE`, sem movimentação financeira. O reprocessamento automático dessas pendências não faz parte da implementação atual.
+
+## 2. Garantias financeiras
+
+O processamento foi desenvolvido em torno das seguintes propriedades:
+
+**Precisão monetária**
+
+- Valores financeiros são representados por strings decimais.
+- A classe `Money` utiliza `decimal.js`, sem operações com `number` para representar dinheiro.
+- O PostgreSQL utiliza `NUMERIC(20,2)`.
+- São suportadas as moedas `BRL` e `USD`, com validação de compatibilidade.
+- Valores inválidos e operações que ultrapassam os limites monetários são rejeitados.
+
+**Integridade e atomicidade**
+
+- Alterações de saldo e lançamentos no ledger são confirmados na mesma transação SQL.
+- O ledger é imutável, com proteção no schema do PostgreSQL.
+- Constraints impedem saldos negativos, relações inválidas e registros financeiros inconsistentes.
+- Operações rejeitadas não alteram o saldo nem geram lançamentos financeiros.
+- A abertura de carteira com saldo positivo cria uma transação interna `OPENING` e um lançamento `CREDIT`.
+
+**Concorrência**
+
+- O PostgreSQL utiliza bloqueio por carteira com `SELECT ... FOR UPDATE`.
+- Atualizações financeiras são condicionadas e executadas dentro de transações SQL.
+- Não há lock global para todas as carteiras.
+- Múltiplos processos podem disputar a mesma carteira sem depender de sincronização em memória.
+
+**Idempotência**
+
+- A chave de idempotência e a referência externa são persistidas no banco.
+- O payload financeiro é identificado por hash SHA-256 de uma representação canônica.
+- Repetições legítimas retornam o resultado original, sem reaplicar efeitos financeiros.
+- Reutilizar uma chave com conteúdo diferente produz conflito.
+- Restrições de unicidade no PostgreSQL protegem também contra requisições concorrentes.
+
+Essas garantias são aplicadas pelo banco e pela camada de aplicação, sem depender exclusivamente das propriedades de ordenação ou deduplicação do SQS.
+
+## 3. Arquitetura
+
+A solução utiliza três processos executáveis separadamente:
+
+- **API HTTP:** recebe requisições e executa operações financeiras.
+- **SQS Consumer:** consome comandos, valida mensagens e utiliza o mesmo processamento financeiro da API.
+- **Outbox Publisher:** publica eventos financeiros persistidos na Outbox.
+
+Fluxo simplificado:
+
+```text
+                  +----------------------+
+                  |    Provedores        |
+                  +----------------------+
+                         |        |
+                      HTTP       SQS
+                         |        |
+                         v        v
+                     +------+ +----------+
+                     | API  | | Consumer |
+                     +------+ +----------+
+                         |        |
+                         +---+----+
+                             |
+                             v
+                   +--------------------+
+                   | Processamento      |
+                   | financeiro         |
+                   +--------------------+
+                             |
+                             v
+                   +--------------------+
+                   | PostgreSQL         |
+                   |                    |
+                   | Wallets            |
+                   | Wager Transactions |
+                   | Immutable Ledger   |
+                   | Inbox / Outbox     |
+                   +--------------------+
+                             |
+                             v
+                   +--------------------+
+                   | Outbox Publisher   |
+                   +--------------------+
+                             |
+                             v
+                   +--------------------+
+                   | SQS Events         |
+                   +--------------------+
+```
+
+No processamento por SQS, **Inbox, transação financeira, carteira, ledger e Outbox participam do mesmo commit PostgreSQL**.
+
+O consumidor confirma a mensagem no SQS somente depois do commit. O publisher publica eventos persistidos, confirma o envio e então registra o evento como publicado.
+
+O publisher utiliza controle de concorrência com `FOR UPDATE SKIP LOCKED`, tokens de claim e leases, permitindo recuperação de trabalhos abandonados após falhas.
+
+A publicação de eventos segue semântica **at-least-once**: uma falha entre o envio ao SQS e a confirmação no PostgreSQL pode produzir uma segunda publicação. Por isso, os eventos possuem identificadores estáveis para deduplicação pelos consumidores.
+
+Mais detalhes em [ARCHITECTURE.md](ARCHITECTURE.md) e [infra/MESSAGING.md](infra/MESSAGING.md).
+
+## 4. Tecnologias
+
+| Componente | Tecnologia |
+|---|---|
+| Runtime e gerenciador de pacotes | Bun 1.x |
+| Linguagem | TypeScript com modo `strict` |
+| Framework HTTP | NestJS |
+| Banco de dados | PostgreSQL 17 |
+| Persistência e migrations | MikroORM 7 |
+| Precisão monetária | decimal.js |
+| Mensageria | AWS SQS — SDK v3 |
+| Emulação local do SQS | MiniStack 1.5.36 |
+| Infraestrutura local | Docker Compose |
+| Testes | Bun Test |
+| Análise estática | oxlint e TypeScript |
+
+O TypeScript utiliza `strict`, mantendo a configuração `strictPropertyInitialization=false`, documentada entre as decisões da implementação.
+
+### Organização do projeto
+
+```text
+.
+├── README.md
+├── ARCHITECTURE.md
+├── backend/
+│   ├── .env.example
+│   ├── package.json
+│   ├── bun.lock
+│   ├── src/
+│   │   ├── domain/
+│   │   ├── application/
+│   │   ├── api/
+│   │   ├── infrastructure/
+│   │   ├── workers/
+│   │   └── migrations/
+│   ├── test/
+│   └── distributed-test/
+└── infra/
+    ├── compose.yaml
+    ├── init-sqs.sh
+    └── MESSAGING.md
+```
+
+As responsabilidades principais estão distribuídas entre domínio, serviços de aplicação, controllers HTTP, adaptadores de infraestrutura e processos de trabalho.
+
+A persistência financeira utiliza SQL parametrizado executado dentro das transações gerenciadas pelo MikroORM.
+
+## 5. Como executar
+
+### 5.1. Pré-requisitos
+
+É necessário ter:
+
+- Bun 1.x disponível no `PATH` — validado com Bun 1.4.4.
+- Node.js compatível com o Nest CLI — validado com Node.js 22.22.3.
+- Docker e Docker Compose.
+- Acesso autorizado ao daemon Docker.
+- Portas `3000`, `5433` e `4566` disponíveis.
+
+Não é necessária uma conta AWS nem credenciais pagas. A mensageria utiliza o MiniStack local.
+
+### 5.2. Configurar o ambiente
+
+Na raiz do repositório, copie o arquivo de exemplo, caso ainda não exista um `.env` local:
+
+```bash
 cp -n backend/.env.example backend/.env
 ```
 
-Edite `.env` localmente. `change_me` é um placeholder: escolha uma senha de
-desenvolvimento e nunca versione o arquivo real. Aplicação e workers carregam
-`.env` a partir de `backend`; o Compose recebe esse arquivo explicitamente:
+Revise o conteúdo de `backend/.env` e ajuste as variáveis para o ambiente de desenvolvimento.
 
-```sh
-docker compose --env-file backend/.env -f infra/compose.yaml config --quiet
-docker compose --env-file backend/.env -f infra/compose.yaml up -d postgres ministack
-docker compose --env-file backend/.env -f infra/compose.yaml ps
+Os valores `change_me` são placeholders e devem ser substituídos por configurações locais apropriadas.
+
+**Nunca versione o arquivo `.env` real.**
+
+A API e os workers carregam a configuração a partir do diretório `backend`. O Docker Compose recebe o arquivo explicitamente com `--env-file`.
+
+### 5.3. Iniciar PostgreSQL e MiniStack
+
+Na raiz do repositório:
+
+```bash
+docker compose \
+  --env-file backend/.env \
+  -f infra/compose.yaml \
+  config --quiet
 ```
 
-Os volumes `postgres_data` e `sqs_data` preservam estado; não precisam ser apagados.
-Alterar a senha no arquivo não altera a senha de um PostgreSQL já inicializado:
-preserve as configurações compatíveis com seu volume existente. O healthcheck
-atual do Compose pressupõe o usuário `jungle` e o banco `jungle_wagering` do exemplo.
+Se a configuração estiver válida, inicie os serviços:
 
-O hook cria quatro filas FIFO distintas:
+```bash
+docker compose \
+  --env-file backend/.env \
+  -f infra/compose.yaml \
+  up -d postgres ministack
+```
 
-| Fila | Uso |
-| --- | --- |
-| wager-transactions.fifo | Comandos financeiros |
-| wager-transactions-dlq.fifo | DLQ dos comandos |
-| wager-events.fifo | Eventos da Outbox |
-| wager-events-dlq.fifo | DLQ disponível para consumidores de eventos futuros |
+Confira os containers:
 
-O SDK usa credenciais fictícias fixas `test/test`, endpoint local `SQS_ENDPOINT`
-e região `AWS_REGION`. Endpoint AWS real é rejeitado. Defaults em `.env.example`.
-Para instalar as dependências travadas e repetir a inicialização sem apagar mensagens:
+```bash
+docker compose \
+  --env-file backend/.env \
+  -f infra/compose.yaml \
+  ps
+```
 
-```sh
+Os volumes `postgres_data` e `sqs_data` preservam os dados entre reinicializações.
+
+**Observação:** alterar a senha de um PostgreSQL já inicializado não modifica automaticamente as credenciais armazenadas no banco. Se estiver reutilizando um volume existente, mantenha as configurações compatíveis.
+
+O Compose atual utiliza, como referência, o usuário `jungle` e o banco `jungle_wagering`.
+
+### 5.4. Instalar dependências
+
+Entre no diretório `backend`:
+
+```bash
 cd backend
 bun install --frozen-lockfile
+```
+
+### 5.5. Inicializar as filas SQS
+
+Ainda dentro de `backend`:
+
+```bash
 bun run queues:init
 ```
 
-## Banco de avaliação e migrations
+A infraestrutura utiliza quatro filas FIFO:
 
-Este roteiro executa API, workers e testes em **jungle_wagering_test**. O Compose
-cria inicialmente `jungle_wagering`. Crie o banco de teste uma única vez, na raiz,
-**se ele ainda não existir**; caso contrário, pule esse comando:
+| Fila | Finalidade |
+|---|---|
+| `wager-transactions.fifo` | Recebimento dos comandos financeiros |
+| `wager-transactions-dlq.fifo` | Dead Letter Queue dos comandos |
+| `wager-events.fifo` | Publicação dos eventos da Outbox |
+| `wager-events-dlq.fifo` | DLQ disponível para futuros consumidores de eventos |
 
-```sh
-docker compose --env-file backend/.env -f infra/compose.yaml exec -T postgres \
+O cliente SQS utiliza o endpoint local configurado por `SQS_ENDPOINT`, a região definida em `AWS_REGION` e credenciais fictícias de desenvolvimento.
+
+A configuração rejeita endpoints AWS reais.
+
+### 5.6. Preparar o banco de testes
+
+O roteiro abaixo usa `jungle_wagering_test`, isolando os exemplos e as suítes de integração do banco principal de desenvolvimento.
+
+O Compose inicializa `jungle_wagering`. Se o banco `jungle_wagering_test` ainda não existir, crie-o **uma única vez**, a partir da raiz do repositório:
+
+```bash
+docker compose \
+  --env-file backend/.env \
+  -f infra/compose.yaml \
+  exec -T postgres \
   sh -c 'createdb -U "$POSTGRES_USER" jungle_wagering_test'
 ```
 
-Dentro de `backend`:
+Se o banco já existir, não execute novamente esse comando.
 
-```sh
+Dentro de `backend`, aplique as migrations no banco de testes:
+
+```bash
 DB_NAME=jungle_wagering_test bun run db:migrate:test
+```
+
+Em seguida, compile o projeto:
+
+```bash
 bun run build
 ```
 
-O script recusa outro DB_NAME. As migrations têm up/down:
+### Migrations
 
-| Migration | Conteúdo |
-| --- | --- |
-| Migration20261104000000 | Wallets, transações, ledger e constraints iniciais |
-| Migration20261104000001 | Integridade composta do ledger e referências de reversões |
-| Migration20261104000002 | Inbox, Outbox, índices e constraints de mensageria |
+As migrations são versionadas:
 
-Não há migration automática no startup. Para uma instalação separada no banco
-selecionado pelo ambiente, o CLI existente também permite, após build:
+| Migration | Responsabilidade |
+|---|---|
+| `Migration20261104000000` | Wallets, transações, ledger e constraints financeiras iniciais |
+| `Migration20261104000001` | Integridade relacional do ledger e referências de reversões |
+| `Migration20261104000002` | Inbox, Outbox, índices e constraints de mensageria |
 
-```sh
+As migrations não são aplicadas automaticamente durante a inicialização da API.
+
+Para migração administrativa de outro banco configurado, existe também o comando do MikroORM:
+
+```bash
 bunx mikro-orm migration:up --config ./dist/mikro-orm.config.js
 ```
 
-Esse último comando migra o banco selecionado por DB_NAME/.env: revise o destino.
-A preparação da entrega não aplica migrations no banco principal.
+**Atenção:** esse último comando utiliza o banco selecionado pelas variáveis de ambiente. Confira o destino antes de executá-lo. Para os testes apresentados neste README, utilize o script específico de `jungle_wagering_test`.
 
-## Executar API, consumidor e publisher
+## 6. Iniciar a aplicação
 
-Depois de inicializar filas, aplicar migrations e compilar, em três terminais,
-sempre a partir de `backend`:
+Após subir os containers, inicializar as filas, aplicar as migrations e compilar, execute os três processos em terminais separados.
 
-```sh
-# Terminal 1
+Todos os comandos abaixo devem ser executados dentro de `backend`.
+
+**Terminal 1 — API HTTP**
+
+```bash
 DB_NAME=jungle_wagering_test bun run start:prod
-# Terminal 2
+```
+
+**Terminal 2 — SQS Consumer**
+
+```bash
 DB_NAME=jungle_wagering_test bun run start:consumer
-# Terminal 3
+```
+
+**Terminal 3 — Outbox Publisher**
+
+```bash
 DB_NAME=jungle_wagering_test bun run start:publisher
 ```
 
-`bun run start` compila antes da API; `start:dev` existe para watch. PORT padrão: 3000.
-SIGTERM/SIGINT solicitam shutdown dos workers. Não há worker de referências pendentes.
+A API utiliza a porta `3000` por padrão.
 
-```sh
+O consumidor processa comandos recebidos do SQS, enquanto o publisher entrega os eventos persistidos na Outbox.
+
+Os workers implementam tratamento de sinais de encerramento, incluindo `SIGTERM` e `SIGINT`.
+
+### Health checks
+
+Com a API em execução:
+
+```bash
 curl -sS http://localhost:3000/health/live
 curl -sS http://localhost:3000/health/ready
 ```
 
-Readiness exige PostgreSQL e as quatro filas acessíveis e pode retornar 503.
-**A API não tem autenticação: use em ambiente local isolado.**
+- `/health/live`: verifica se o processo está ativo.
+- `/health/ready`: verifica as dependências necessárias, incluindo PostgreSQL e as filas SQS.
 
-## Exemplos HTTP
+O endpoint de readiness pode retornar HTTP `503` quando uma dependência estiver indisponível.
 
-Com API no banco de avaliação, dentro de `backend`, gere um player por demonstração:
+**Importante:** esta implementação não possui autenticação. Execute a API em um ambiente local isolado, sem exposição pública.
 
-```sh
+## 7. API HTTP
+
+### 7.1. Criar uma carteira
+
+Com a API em execução, gere um identificador UUID para o jogador:
+
+```bash
 export PLAYER_ID="$(bun -e 'console.log(crypto.randomUUID())')"
-curl -sS -X POST http://localhost:3000/wallets \
-  -H 'Content-Type: application/json' \
-  -d "{\"playerId\":\"$PLAYER_ID\",\"initialBalance\":{\"amount\":\"100.00\",\"currency\":\"BRL\"}}"
 ```
 
-Copie o `id` retornado para WALLET_ID:
+Crie uma carteira com saldo inicial de `100.00 BRL`:
 
-```sh
+```bash
+curl -sS -X POST http://localhost:3000/wallets \
+  -H 'Content-Type: application/json' \
+  -d "{
+    \"playerId\": \"$PLAYER_ID\",
+    \"initialBalance\": {
+      \"amount\": \"100.00\",
+      \"currency\": \"BRL\"
+    }
+  }"
+```
+
+A resposta contém o identificador da carteira, o saldo e a versão.
+
+A abertura com saldo positivo também registra uma operação interna `OPENING` e seu lançamento no ledger.
+
+Copie o identificador retornado para a variável:
+
+```bash
 export WALLET_ID='substitua-pelo-id-retornado'
+```
+
+### 7.2. Registrar uma aposta (BET)
+
+```bash
 curl -sS -X POST http://localhost:3000/wagering/transactions \
   -H 'Content-Type: application/json' \
   -H 'Idempotency-Key: demo:bet-http-1' \
-  -d "{\"providerId\":\"demo\",\"externalTransactionId\":\"bet-http-1\",\"playerId\":\"$PLAYER_ID\",\"walletId\":\"$WALLET_ID\",\"roundId\":\"round-1\",\"gameId\":\"game-1\",\"kind\":\"BET\",\"money\":{\"amount\":\"25.00\",\"currency\":\"BRL\"}}"
+  -d "{
+    \"providerId\": \"demo\",
+    \"externalTransactionId\": \"bet-http-1\",
+    \"playerId\": \"$PLAYER_ID\",
+    \"walletId\": \"$WALLET_ID\",
+    \"roundId\": \"round-1\",
+    \"gameId\": \"game-1\",
+    \"kind\": \"BET\",
+    \"money\": {
+      \"amount\": \"25.00\",
+      \"currency\": \"BRL\"
+    }
+  }"
 ```
 
-Resposta inicial esperada: status PROCESSED, balance.amount "75.00",
-idempotentReplay false, failureCode null e transactionId gerado. Repetir o mesmo
-comando retorna o resultado original com replay verdadeiro. Use chaves e referências
-externas novas em demonstrações independentes.
+Para uma carteira nova com saldo inicial de `100.00 BRL`, a primeira aposta válida de `25.00 BRL` deixa o saldo em `75.00 BRL`.
 
-WIN/LOSS usam a mesma rota, alterando kind, chave e referência externa. REFUND e
-ROLLBACK exigem referenceExternalTransactionId, valor integral e escopo compatível
-com a referência. OPENING é interno. Valores monetários são strings de escala 2,
-BRL ou USD; todas as operações externas exigem valor positivo, inclusive LOSS.
+Exemplo da estrutura de resposta:
 
-| Situação | HTTP |
-| --- | --- |
-| Wallet criada | 201 |
-| Operação processada ou replay | 200 |
-| Referência ausente | 202 |
-| Payload inválido | 400 |
-| Wallet inexistente | 404 |
-| Idempotência, wallet incompatível ou wallet duplicada | 409 |
-| Rejeição financeira persistida | 422 |
-| Falha SQL/inesperada na operação | 500 padrão NestJS |
+```json
+{
+  "transactionId": "uuid-gerado-pelo-servidor",
+  "status": "PROCESSED",
+  "balance": {
+    "amount": "75.00",
+    "currency": "BRL"
+  },
+  "idempotentReplay": false,
+  "failureCode": null
+}
+```
 
-## Exemplo SQS sem AWS CLI
+Repetir a mesma requisição, preservando a chave e o payload, retorna a resposta original com `idempotentReplay: true`, sem efetuar outro débito.
 
-Com os mesmos PLAYER_ID e WALLET_ID exportados, dentro de `backend`:
+Para executar uma nova operação, utilize outra `Idempotency-Key` e outro `externalTransactionId`.
 
-```sh
+### 7.3. Demais operações
+
+As operações `WIN`, `LOSS`, `REFUND` e `ROLLBACK` utilizam a mesma rota:
+
+```text
+POST /wagering/transactions
+```
+
+Altere o campo `kind` e informe identificadores únicos para cada nova operação.
+
+Para `REFUND` e `ROLLBACK`, também é obrigatório fornecer:
+
+```json
+{
+  "referenceExternalTransactionId": "bet-http-1"
+}
+```
+
+Esse campo identifica a operação original dentro do mesmo provedor.
+
+Regras relevantes:
+
+- `WIN` credita saldo e pode referenciar uma `BET` da mesma rodada.
+- `LOSS` registra o resultado sem alterar o saldo.
+- `REFUND` exige uma `BET` processada e devolve seu valor integral.
+- `ROLLBACK` inverte uma `BET`, `WIN` ou `REFUND` processada.
+- Reversões não podem ser parciais.
+- Cada referência pode receber no máximo uma reversão processada de cada tipo.
+- Reversões que produziriam saldo negativo são rejeitadas sem alterar a carteira.
+
+### 7.4. Respostas HTTP
+
+| Situação | Status |
+|---|---|
+| Carteira criada | `201 Created` |
+| Transação processada ou replay | `200 OK` |
+| Referência ainda não encontrada | `202 Accepted` |
+| Payload inválido | `400 Bad Request` |
+| Carteira não encontrada | `404 Not Found` |
+| Conflito de idempotência ou identidade da carteira | `409 Conflict` |
+| Rejeição financeira persistida | `422 Unprocessable Entity` |
+| Falha inesperada ou de infraestrutura não tratada | `500 Internal Server Error` |
+
+Rejeições financeiras persistidas possuem `failureCode` para permitir identificação programática da causa.
+
+## 8. Processamento por SQS
+
+Além da API HTTP, o sistema aceita comandos financeiros através da fila `wager-transactions.fifo`.
+
+O consumidor utiliza o mesmo processamento financeiro da API, com validações, idempotência e atomicidade transacional.
+
+### Exemplo de mensagem
+
+```json
+{
+  "messageId": "uuid-da-mensagem",
+  "type": "WagerTransactionRequested",
+  "occurredAt": "2026-11-04T20:00:00.000Z",
+  "data": {
+    "providerId": "demo",
+    "externalTransactionId": "bet-sqs-1",
+    "idempotencyKey": "demo:bet-sqs-1",
+    "playerId": "uuid-do-jogador",
+    "walletId": "uuid-da-carteira",
+    "roundId": "round-sqs-1",
+    "gameId": "game-1",
+    "kind": "BET",
+    "money": {
+      "amount": "10.00",
+      "currency": "BRL"
+    }
+  }
+}
+```
+
+### Enviar uma mensagem sem AWS CLI
+
+Com `PLAYER_ID` e `WALLET_ID` exportados no terminal e dentro do diretório `backend`:
+
+```bash
 bun -e '
 import "dotenv/config";
 import { SendMessageCommand } from "@aws-sdk/client-sqs";
-import { createSqsClient, resolveQueues } from "./src/infrastructure/sqs/sqs-config.ts";
+import {
+  createSqsClient,
+  resolveQueues
+} from "./src/infrastructure/sqs/sqs-config.ts";
+
 const client = createSqsClient();
+
 try {
   const queues = await resolveQueues(client);
   const id = crypto.randomUUID();
+
   const message = {
-    messageId: id, type: "WagerTransactionRequested", occurredAt: new Date().toISOString(),
+    messageId: id,
+    type: "WagerTransactionRequested",
+    occurredAt: new Date().toISOString(),
     data: {
-      providerId: "demo", externalTransactionId: `bet-sqs-${id}`, idempotencyKey: `demo:${id}`,
-      playerId: process.env.PLAYER_ID, walletId: process.env.WALLET_ID,
-      roundId: "round-2", gameId: "game-1", kind: "BET",
-      money: { amount: "10.00", currency: "BRL" }
+      providerId: "demo",
+      externalTransactionId: `bet-sqs-${id}`,
+      idempotencyKey: `demo:${id}`,
+      playerId: process.env.PLAYER_ID,
+      walletId: process.env.WALLET_ID,
+      roundId: "round-2",
+      gameId: "game-1",
+      kind: "BET",
+      money: {
+        amount: "10.00",
+        currency: "BRL"
+      }
     }
   };
+
   await client.send(new SendMessageCommand({
-    QueueUrl: queues.commands, MessageBody: JSON.stringify(message),
-    MessageGroupId: process.env.WALLET_ID, MessageDeduplicationId: id
+    QueueUrl: queues.commands,
+    MessageBody: JSON.stringify(message),
+    MessageGroupId: process.env.WALLET_ID,
+    MessageDeduplicationId: id
   }));
+
   console.log("Comando enviado ao MiniStack");
-} finally { client.destroy(); }
+} finally {
+  client.destroy();
+}
 '
 ```
 
-O consumidor grava a Inbox e executa o mesmo caso de uso HTTP. O publisher envia
-eventos à fila de eventos; ela não alimenta o consumidor financeiro. Não existe
-consumidor de projeções/eventos nesta entrega.
+O consumidor processa a mensagem e registra o resultado no PostgreSQL.
 
-## Validação
+O publisher envia os eventos confirmados para `wager-events.fifo`, uma fila separada daquela utilizada para comandos financeiros.
 
-Em `backend`, com dependências, migrations, PostgreSQL e MiniStack disponíveis:
+Não há consumidor de projeções ou de eventos downstream nesta entrega.
 
-```sh
+### Inbox e Outbox
+
+O processamento utiliza dois mecanismos complementares.
+
+**Inbox**
+
+- Registra a identidade das mensagens recebidas.
+- Deduplica entregas repetidas.
+- Detecta reutilização de `messageId` com conteúdo divergente.
+- Participa da mesma transação SQL da operação financeira.
+- Permite confirmação da mensagem somente depois do commit.
+
+**Transactional Outbox**
+
+- Registra eventos de integração junto com a operação financeira.
+- Publica eventos de forma assíncrona após o commit.
+- Utiliza claims, leases e `SKIP LOCKED` para concorrência entre publishers.
+- Implementa tentativas de republicação e recuperação de claims abandonados.
+- Preserva identificadores estáveis de eventos.
+
+Eventos suportados incluem:
+
+- `WagerTransactionProcessed`
+- `WagerTransactionRejected`
+- `WalletBalanceChanged`
+- `WagerTransactionPendingReference`
+
+A infraestrutura utiliza semântica *at-least-once*. Consumidores futuros da fila de eventos devem implementar deduplicação pelo identificador do evento e considerar possíveis diferenças de ordem entre publicações.
+
+## 9. Testes e validação
+
+O projeto utiliza Bun Test para testes unitários, de integração e distribuídos.
+
+A validação foi realizada com PostgreSQL real e MiniStack em containers, sem substituí-los integralmente por mocks.
+
+### Executar a suíte
+
+Dentro do diretório `backend`, com os containers e migrations disponíveis:
+
+```bash
 bun run build
 bun run test
 DB_NAME=jungle_wagering_test bun run test:e2e
 DB_NAME=jungle_wagering_test bun run test:distributed
 bun run lint
 bunx tsc --noEmit --incremental false
-git diff --check
 ```
 
-Nunca execute suítes PostgreSQL contra o banco principal. As de mensageria criam
-schemas e filas exclusivos e preservam dados de auditoria: execuções repetidas
-acumulam dados de teste. SQS real é obrigatório; indisponibilidade falha a suíte,
-sem fallback para mocks. TypeScript usa strict com a exceção existente
-strictPropertyInitialization=false. Resultados: [validação](ARCHITECTURE.md#validação-da-entrega).
+Os testes de integração devem ser executados exclusivamente contra `jungle_wagering_test`.
 
-## Matriz da entrega
+A suíte distribuída utiliza schemas e filas próprios e pode preservar registros de auditoria entre execuções. Não é necessário apagar volumes para executá-la.
 
-| Requisito | Estado | Limite |
-| --- | --- | --- |
-| Money, saldo, ledger e constraints | Implementado | BRL/USD, escala 2 |
-| OPENING, BET, WIN, LOSS, REFUND, ROLLBACK | Implementado | Referências disponíveis permitem conclusão imediata |
-| Idempotência e concorrência distribuída | Implementado | PostgreSQL como autoridade |
-| SQS, Inbox, Outbox e recuperação de workers | Implementado | Publicação at-least-once |
-| Referências fora de ordem | Parcial | PENDING_REFERENCE; sem resolução, backoff/TTL ou conclusão posterior |
-| Modelagem DDD | Parcial | VOs/entidades/eventos; decisões financeiras nos serviços SQL |
-| Observabilidade | Parcial | Health e logs básicos; faltam métricas e contexto completo |
-| Consultas HTTP e reconciliação | Ausente | GETs financeiros e endpoint de reconciliação |
-| Autenticação e ponto de extensão dedicado | Ausente | Desenho documentado, sem Guard/port implementado |
+### Resultados da última validação
 
-Detalhes: [ARCHITECTURE.md](ARCHITECTURE.md) e [infra/MESSAGING.md](infra/MESSAGING.md).
+| Categoria | Testes aprovados |
+|---|---:|
+| Testes unitários | 88 |
+| Integração e E2E PostgreSQL | 122 |
+| Testes distribuídos com MiniStack | 20 |
+| **Total** | **230** |
 
-## Checklist antes de publicar
+Na última execução reportada:
 
-- [ ] Revisar o diff completo, incluindo os arquivos novos de mensageria da etapa anterior.
-- [ ] Incluir as três migrations, scripts, lockfile e documentação na entrega revisada.
-- [ ] Conferir que .env, credenciais, dumps, volumes, node_modules e dist não serão adicionados.
-- [ ] Executar um scanner de segredos no histórico Git antes de tornar o repositório público.
-- [ ] Reproduzir o roteiro em ambiente limpo com bancos/volumes novos separados dos existentes.
-- [ ] Informar ao avaliador as lacunas da matriz, sem declarar conformidade integral.
+- Build aprovado.
+- 230 testes aprovados, sem falhas.
+- Lint sem erros ou avisos.
+- Verificação de tipos TypeScript aprovada.
 
-A preparação não faz commit, push, publicação ou remoção de volumes. Os testes
-não equivalem a uma instalação do zero comprovada em outra máquina.
+### Cenários exercitados
+
+Entre os cenários cobertos pelos testes estão:
+
+- Precisão monetária, valores inválidos e overflow.
+- Regras de `BET`, `WIN`, `LOSS`, `REFUND` e `ROLLBACK`.
+- Saldo insuficiente e reversões rejeitadas.
+- Imutabilidade e integridade do ledger.
+- Replay idempotente e conflitos de payload.
+- Concorrência sobre a mesma carteira.
+- Processamento concorrente em três processos independentes.
+- Recebimento e redelivery de mensagens SQS.
+- Deduplicação por Inbox persistente.
+- Rollback integral quando a persistência do ledger ou da Outbox falha.
+- Rejeições financeiras com resposta auditável.
+- Retry e encaminhamento para a DLQ.
+- Publishers concorrentes.
+- Recuperação após falhas de processo em cenários específicos.
+- Encerramento controlado dos workers com `SIGTERM`.
+
+Os testes demonstram os comportamentos exercitados nos cenários implementados. Não representam uma garantia de ausência de falhas em todas as condições possíveis de produção.
+
+## 10. Escopo e limitações
+
+Esta implementação prioriza a correção financeira, idempotência persistente e execução distribuída. Algumas partes do edital permanecem parciais ou fora do escopo entregue.
+
+| Requisito | Situação | Observações |
+|---|---|---|
+| Precisão monetária e saldo não negativo | Implementado | Money com decimal.js e constraints PostgreSQL |
+| Ledger imutável | Implementado | Lançamentos persistidos com restrições no banco |
+| OPENING, BET, WIN, LOSS, REFUND e ROLLBACK | Implementado | Operações com referências disponíveis podem ser concluídas imediatamente |
+| Idempotência e concorrência | Implementado | Garantias persistidas e controle por wallet |
+| SQS, Inbox e Outbox | Implementado | Processamento at-least-once e recuperação de workers |
+| Referências fora de ordem | Parcial | `PENDING_REFERENCE` é persistido, sem worker de resolução automática |
+| Modelagem orientada a domínio | Parcial | Value Objects, entidades e eventos; parte das decisões permanece nos serviços SQL |
+| Observabilidade | Parcial | Health checks e logs básicos; métricas e correlação completa não implementadas |
+| Consultas financeiras HTTP | Não implementado | Consultas de carteira, transações e extrato |
+| Reconciliação HTTP | Não implementado | Endpoint de comparação entre saldo materializado e ledger |
+| Autenticação | Não implementado | Decisão e proposta de integração descritas em ARCHITECTURE.md |
+
+### Decisões e trade-offs
+
+**Referências pendentes**
+
+O sistema registra referências não encontradas como `PENDING_REFERENCE`, preservando a operação para auditoria, sem movimentar saldo. Ainda não existe um worker que tente resolver automaticamente essas dependências com backoff e TTL.
+
+**Mensageria**
+
+A publicação da Outbox oferece recuperação e entrega *at-least-once*, não *exactly-once* no broker. Duplicações possíveis após falhas de publicação precisam ser tratadas pelos consumidores downstream.
+
+**Ordenação**
+
+Publishers concorrentes podem publicar eventos de uma mesma carteira fora da ordem original. Os eventos de alteração de saldo carregam a versão da wallet, representada como string para preservar a precisão do `BIGINT`.
+
+**Autenticação**
+
+A API foi mantida sem autenticação para concentrar o desenvolvimento nas invariantes financeiras e distribuídas. Uma evolução para produção exigiria integração com um Identity Provider, autenticação dos provedores e autorização por escopo.
+
+**Observabilidade**
+
+A implementação dispõe de health checks, mas não inclui toda a instrumentação de métricas, logs estruturados com correlação completa e dashboards necessária para operação em produção.
+
+**Ambiente**
+
+Os testes foram executados com infraestrutura local real. A reprodução integral em uma máquina limpa e independente não foi validada como parte da última execução reportada.
+
+Essas limitações são conhecidas e não devem ser interpretadas como funcionalidades concluídas.
+
+## 11. Documentação adicional
+
+- [ARCHITECTURE.md](ARCHITECTURE.md) — arquitetura, decisões técnicas, fronteiras transacionais, concorrência, idempotência e trade-offs.
+- [infra/MESSAGING.md](infra/MESSAGING.md) — filas, infraestrutura SQS, workers, comandos de operação e testes de mensageria.
+- [Desafio original — Jungle Gaming](https://github.com/junglegaming/backend-challenge) — especificação e critérios de avaliação.
+
+---
+
+Projeto desenvolvido como solução para o desafio técnico **Distributed Wagering Processor — Jungle Gaming**.
